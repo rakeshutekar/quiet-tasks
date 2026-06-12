@@ -1,5 +1,14 @@
 import SwiftUI
+import UserNotifications
 import WidgetKit
+
+struct SubtaskItem: Codable, Identifiable, Equatable {
+    var id: String
+    var title: String
+    var done: Bool
+    var createdAt: Date
+    var updatedAt: Date?
+}
 
 struct TaskItem: Codable, Identifiable, Equatable {
     var id: String
@@ -11,9 +20,29 @@ struct TaskItem: Codable, Identifiable, Equatable {
     var priority: TaskPriority?
     var updatedAt: Date?
     var completedAt: Date?
+    var subtasks: [SubtaskItem]? = nil
+    var recurrence: TaskRecurrence? = nil
+    var pinned: Bool? = nil
 
     var taskPriority: TaskPriority {
         priority ?? .normal
+    }
+
+    var taskSubtasks: [SubtaskItem] {
+        subtasks ?? []
+    }
+
+    var isPinned: Bool {
+        pinned ?? false
+    }
+
+    var completedSubtaskCount: Int {
+        taskSubtasks.filter(\.done).count
+    }
+
+    var subtaskProgressText: String? {
+        guard !taskSubtasks.isEmpty else { return nil }
+        return "\(completedSubtaskCount)/\(taskSubtasks.count) subtasks"
     }
 }
 
@@ -49,15 +78,85 @@ enum TaskPriority: String, CaseIterable, Codable, Identifiable {
     }
 }
 
-enum TaskStore {
-    static var fileURL: URL {
-        sharedDirectory.appendingPathComponent("tasks.json")
+enum TaskRecurrence: String, CaseIterable, Codable, Identifiable {
+    case daily
+    case weekly
+    case monthly
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .daily: "Daily"
+        case .weekly: "Weekly"
+        case .monthly: "Monthly"
+        }
     }
 
-    private static var sharedDirectory: URL {
+    var symbol: String {
+        switch self {
+        case .daily: "repeat"
+        case .weekly: "calendar.badge.clock"
+        case .monthly: "calendar"
+        }
+    }
+
+    func nextDate(after deadline: Date, now: Date = Date()) -> Date {
+        let calendar = Calendar.current
+        let component: Calendar.Component = switch self {
+        case .daily: .day
+        case .weekly: .weekOfYear
+        case .monthly: .month
+        }
+
+        var next = calendar.date(byAdding: component, value: 1, to: deadline) ?? now
+        while next <= now {
+            next = calendar.date(byAdding: component, value: 1, to: next) ?? now
+        }
+        return next
+    }
+}
+
+enum ReminderOffset: Int, CaseIterable, Codable, Identifiable {
+    case atDeadline = 0
+    case fifteenMinutes = 900
+    case oneHour = 3600
+    case oneDay = 86400
+
+    var id: Int { rawValue }
+
+    var title: String {
+        switch self {
+        case .atDeadline: "At deadline"
+        case .fifteenMinutes: "15 min before"
+        case .oneHour: "1 hour before"
+        case .oneDay: "1 day before"
+        }
+    }
+
+    func fireDate(for deadline: Date) -> Date {
+        deadline.addingTimeInterval(-TimeInterval(rawValue))
+    }
+}
+
+struct NotificationSettings: Codable, Equatable {
+    var enabled: Bool
+    var reminderOffsets: [ReminderOffset]
+
+    static let `default` = NotificationSettings(enabled: false, reminderOffsets: [.oneHour])
+}
+
+enum SharedFiles {
+    static var directory: URL {
         let directory = URL(fileURLWithPath: "/Users/Shared/QuietTasks", isDirectory: true)
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         return directory
+    }
+}
+
+enum TaskStore {
+    static var fileURL: URL {
+        SharedFiles.directory.appendingPathComponent("tasks.json")
     }
 
     private static var legacyFileURLs: [URL] {
@@ -90,7 +189,7 @@ enum TaskStore {
 
     static func save(_ tasks: [TaskItem]) {
         guard let data = try? JSONEncoder.taskEncoder.encode(tasks) else { return }
-        try? FileManager.default.createDirectory(at: sharedDirectory, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(at: SharedFiles.directory, withIntermediateDirectories: true)
         try? data.write(to: fileURL, options: .atomic)
         WidgetCenter.shared.reloadAllTimelines()
     }
@@ -103,6 +202,7 @@ enum TaskStore {
     static func normalized(_ tasks: [TaskItem]) -> [TaskItem] {
         tasks.sorted { lhs, rhs in
             if lhs.done != rhs.done { return !lhs.done }
+            if lhs.isPinned != rhs.isPinned { return lhs.isPinned }
             if lhs.taskPriority.rank != rhs.taskPriority.rank { return lhs.taskPriority.rank < rhs.taskPriority.rank }
             switch (lhs.deadline, rhs.deadline) {
             case let (left?, right?) where left != right:
@@ -115,6 +215,79 @@ enum TaskStore {
                 break
             }
             return lhs.createdAt > rhs.createdAt
+        }
+    }
+}
+
+enum SettingsStore {
+    static var fileURL: URL {
+        SharedFiles.directory.appendingPathComponent("settings.json")
+    }
+
+    static func load() -> NotificationSettings {
+        guard let data = try? Data(contentsOf: fileURL),
+              let settings = try? JSONDecoder.taskDecoder.decode(NotificationSettings.self, from: data)
+        else {
+            return .default
+        }
+        return settings.reminderOffsets.isEmpty && settings.enabled
+            ? NotificationSettings(enabled: settings.enabled, reminderOffsets: [.oneHour])
+            : settings
+    }
+
+    static func save(_ settings: NotificationSettings) {
+        guard let data = try? JSONEncoder.taskEncoder.encode(settings) else { return }
+        try? FileManager.default.createDirectory(at: SharedFiles.directory, withIntermediateDirectories: true)
+        try? data.write(to: fileURL, options: .atomic)
+    }
+}
+
+enum NotificationScheduler {
+    private static let identifierPrefix = "quiettasks.deadline."
+
+    static func requestAuthorization(completion: @escaping (Bool) -> Void) {
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { granted, _ in
+            DispatchQueue.main.async {
+                completion(granted)
+            }
+        }
+    }
+
+    static func sync(tasks: [TaskItem], settings: NotificationSettings) {
+        let center = UNUserNotificationCenter.current()
+        center.getPendingNotificationRequests { requests in
+            let existingIdentifiers = requests
+                .map(\.identifier)
+                .filter { $0.hasPrefix(identifierPrefix) }
+            center.removePendingNotificationRequests(withIdentifiers: existingIdentifiers)
+
+            guard settings.enabled else { return }
+
+            for task in tasks where !task.done {
+                guard let deadline = task.deadline else { continue }
+
+                for offset in settings.reminderOffsets {
+                    let fireDate = offset.fireDate(for: deadline)
+                    guard fireDate > Date().addingTimeInterval(5) else { continue }
+
+                    let content = UNMutableNotificationContent()
+                    content.title = task.title
+                    content.body = offset == .atDeadline ? "Due now" : "Due \(offset.title.lowercased())"
+                    content.sound = .default
+
+                    let components = Calendar.current.dateComponents(
+                        [.year, .month, .day, .hour, .minute],
+                        from: fireDate
+                    )
+                    let trigger = UNCalendarNotificationTrigger(dateMatching: components, repeats: false)
+                    let request = UNNotificationRequest(
+                        identifier: "\(identifierPrefix)\(task.id).\(offset.rawValue)",
+                        content: content,
+                        trigger: trigger
+                    )
+                    center.add(request)
+                }
+            }
         }
     }
 }
@@ -164,7 +337,14 @@ enum TaskFilter: String, CaseIterable, Identifiable {
 }
 
 final class TaskModel: ObservableObject {
-    @Published private(set) var tasks: [TaskItem] = TaskStore.load()
+    @Published private(set) var tasks: [TaskItem]
+    @Published private(set) var notificationSettings: NotificationSettings
+
+    init() {
+        tasks = TaskStore.load()
+        notificationSettings = SettingsStore.load()
+        NotificationScheduler.sync(tasks: tasks, settings: notificationSettings)
+    }
 
     var openTasks: [TaskItem] {
         tasks.filter { !$0.done }
@@ -189,9 +369,18 @@ final class TaskModel: ObservableObject {
 
     func reload() {
         tasks = TaskStore.load()
+        notificationSettings = SettingsStore.load()
+        NotificationScheduler.sync(tasks: tasks, settings: notificationSettings)
     }
 
-    func add(title: String, notes: String = "", deadline: Date?, priority: TaskPriority) {
+    func add(
+        title: String,
+        notes: String = "",
+        deadline: Date?,
+        priority: TaskPriority,
+        recurrence: TaskRecurrence?,
+        pinned: Bool
+    ) {
         let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         let cleanNotes = notes.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -204,12 +393,24 @@ final class TaskModel: ObservableObject {
             notes: cleanNotes.isEmpty ? nil : cleanNotes,
             priority: priority,
             updatedAt: nil,
-            completedAt: nil
+            completedAt: nil,
+            subtasks: nil,
+            recurrence: deadline == nil ? nil : recurrence,
+            pinned: pinned ? true : nil
         ), at: 0)
         persist()
     }
 
-    func update(_ task: TaskItem, title: String, notes: String, deadline: Date?, priority: TaskPriority) {
+    func update(
+        _ task: TaskItem,
+        title: String,
+        notes: String,
+        deadline: Date?,
+        priority: TaskPriority,
+        subtasks: [SubtaskItem],
+        recurrence: TaskRecurrence?,
+        pinned: Bool
+    ) {
         let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         let cleanNotes = notes.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -220,6 +421,9 @@ final class TaskModel: ObservableObject {
             updated.notes = cleanNotes.isEmpty ? nil : cleanNotes
             updated.deadline = deadline
             updated.priority = priority
+            updated.subtasks = subtasks.isEmpty ? nil : subtasks
+            updated.recurrence = deadline == nil ? nil : recurrence
+            updated.pinned = pinned ? true : nil
             updated.updatedAt = Date()
             return updated
         }
@@ -230,9 +434,26 @@ final class TaskModel: ObservableObject {
         tasks = tasks.map { item in
             guard item.id == task.id else { return item }
             var updated = item
+            if let recurrence = item.recurrence, let deadline = item.deadline {
+                updated.deadline = recurrence.nextDate(after: deadline)
+                updated.subtasks = item.taskSubtasks.map { subtask in
+                    var reset = subtask
+                    reset.done = false
+                    reset.updatedAt = Date()
+                    return reset
+                }
+                updated.updatedAt = Date()
+                return updated
+            }
             updated.done = true
             updated.completedAt = Date()
             updated.updatedAt = Date()
+            updated.subtasks = item.taskSubtasks.map { subtask in
+                var completed = subtask
+                completed.done = true
+                completed.updatedAt = Date()
+                return completed
+            }
             return updated
         }
         persist()
@@ -253,6 +474,53 @@ final class TaskModel: ObservableObject {
     func delete(_ task: TaskItem) {
         tasks.removeAll { $0.id == task.id }
         persist()
+    }
+
+    func togglePinned(_ task: TaskItem) {
+        tasks = tasks.map { item in
+            guard item.id == task.id else { return item }
+            var updated = item
+            updated.pinned = item.isPinned ? nil : true
+            updated.updatedAt = Date()
+            return updated
+        }
+        persist()
+    }
+
+    func toggleSubtask(taskID: String, subtaskID: String) {
+        tasks = tasks.map { item in
+            guard item.id == taskID else { return item }
+            var updated = item
+            updated.subtasks = item.taskSubtasks.map { subtask in
+                guard subtask.id == subtaskID else { return subtask }
+                var changed = subtask
+                changed.done.toggle()
+                changed.updatedAt = Date()
+                return changed
+            }
+            updated.updatedAt = Date()
+            return updated
+        }
+        persist()
+    }
+
+    func updateNotificationSettings(_ settings: NotificationSettings) {
+        if settings.enabled {
+            NotificationScheduler.requestAuthorization { [weak self] granted in
+                guard let self else { return }
+                let savedSettings = NotificationSettings(
+                    enabled: granted,
+                    reminderOffsets: settings.reminderOffsets.isEmpty ? [.oneHour] : settings.reminderOffsets
+                )
+                self.notificationSettings = savedSettings
+                SettingsStore.save(savedSettings)
+                NotificationScheduler.sync(tasks: self.tasks, settings: savedSettings)
+            }
+        } else {
+            notificationSettings = settings
+            SettingsStore.save(settings)
+            NotificationScheduler.sync(tasks: tasks, settings: settings)
+        }
     }
 
     func tasks(for filter: TaskFilter, search: String) -> [TaskItem] {
@@ -283,6 +551,7 @@ final class TaskModel: ObservableObject {
     private func persist() {
         tasks = TaskStore.normalized(tasks)
         TaskStore.save(tasks)
+        NotificationScheduler.sync(tasks: tasks, settings: notificationSettings)
     }
 }
 
@@ -294,6 +563,9 @@ struct TaskDraft: Identifiable {
     var hasDeadline: Bool
     var deadline: Date
     var priority: TaskPriority
+    var subtasks: [SubtaskItem]
+    var recurrence: TaskRecurrence?
+    var pinned: Bool
 
     init(task: TaskItem? = nil) {
         self.task = task
@@ -302,6 +574,9 @@ struct TaskDraft: Identifiable {
         hasDeadline = task?.deadline != nil
         deadline = task?.deadline ?? Date()
         priority = task?.taskPriority ?? .normal
+        subtasks = task?.taskSubtasks ?? []
+        recurrence = task?.recurrence
+        pinned = task?.isPinned ?? false
     }
 }
 
@@ -313,9 +588,12 @@ struct ContentView: View {
     @State private var newDeadline = Date()
     @State private var newHasDeadline = false
     @State private var newPriority: TaskPriority = .normal
+    @State private var newRecurrence: TaskRecurrence?
+    @State private var newPinned = false
     @State private var pendingCompletion: TaskItem?
     @State private var pendingDeletion: TaskItem?
     @State private var editingDraft: TaskDraft?
+    @State private var showingNotificationSettings = false
     @FocusState private var newTaskFocused: Bool
 
     var visibleTasks: [TaskItem] {
@@ -382,6 +660,11 @@ struct ContentView: View {
                 } label: {
                     Label("Refresh", systemImage: "arrow.clockwise")
                 }
+                Button {
+                    showingNotificationSettings = true
+                } label: {
+                    Label("Notifications", systemImage: model.notificationSettings.enabled ? "bell.badge" : "bell")
+                }
             }
         }
         .onOpenURL(perform: handleURL)
@@ -428,11 +711,22 @@ struct ContentView: View {
                     title: updatedDraft.title,
                     notes: updatedDraft.notes,
                     deadline: updatedDraft.hasDeadline ? updatedDraft.deadline : nil,
-                    priority: updatedDraft.priority
+                    priority: updatedDraft.priority,
+                    subtasks: updatedDraft.subtasks,
+                    recurrence: updatedDraft.hasDeadline ? updatedDraft.recurrence : nil,
+                    pinned: updatedDraft.pinned
                 )
                 editingDraft = nil
             } onCancel: {
                 editingDraft = nil
+            }
+        }
+        .sheet(isPresented: $showingNotificationSettings) {
+            NotificationSettingsSheet(settings: model.notificationSettings) { settings in
+                model.updateNotificationSettings(settings)
+                showingNotificationSettings = false
+            } onCancel: {
+                showingNotificationSettings = false
             }
         }
         .frame(minWidth: 880, minHeight: 620)
@@ -473,9 +767,17 @@ struct ContentView: View {
                 .disabled(newTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
 
-            HStack(spacing: 18) {
-                DueDateControl(isEnabled: $newHasDeadline, date: $newDeadline)
-                PriorityPicker(priority: $newPriority)
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 18) {
+                    DueDateControl(isEnabled: $newHasDeadline, date: $newDeadline)
+                        .frame(minWidth: 210, alignment: .leading)
+                    PriorityPicker(priority: $newPriority)
+                }
+
+                HStack(spacing: 18) {
+                    RecurrencePicker(recurrence: $newRecurrence, isEnabled: newHasDeadline)
+                    PinToggle(isPinned: $newPinned)
+                }
             }
         }
         .padding(16)
@@ -490,7 +792,11 @@ struct ContentView: View {
                     onComplete: { pendingCompletion = task },
                     onRestore: { model.restore(task) },
                     onEdit: { editingDraft = TaskDraft(task: task) },
-                    onDelete: { pendingDeletion = task }
+                    onDelete: { pendingDeletion = task },
+                    onTogglePinned: { model.togglePinned(task) },
+                    onToggleSubtask: { subtask in
+                        model.toggleSubtask(taskID: task.id, subtaskID: subtask.id)
+                    }
                 )
             }
         }
@@ -508,10 +814,18 @@ struct ContentView: View {
     }
 
     private func addTask() {
-        model.add(title: newTitle, deadline: newHasDeadline ? newDeadline : nil, priority: newPriority)
+        model.add(
+            title: newTitle,
+            deadline: newHasDeadline ? newDeadline : nil,
+            priority: newPriority,
+            recurrence: newHasDeadline ? newRecurrence : nil,
+            pinned: newPinned
+        )
         newTitle = ""
         newHasDeadline = false
         newPriority = .normal
+        newRecurrence = nil
+        newPinned = false
         selectedFilter = .open
         newTaskFocused = true
     }
@@ -530,6 +844,19 @@ struct ContentView: View {
                 .value
             model.reload()
             pendingCompletion = model.tasks.first { $0.id == id && !$0.done }
+        case "subtask":
+            let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+            let taskID = components?
+                .queryItems?
+                .first { $0.name == "task" }?
+                .value
+            let subtaskID = components?
+                .queryItems?
+                .first { $0.name == "subtask" }?
+                .value
+            if let taskID, let subtaskID {
+                model.toggleSubtask(taskID: taskID, subtaskID: subtaskID)
+            }
         default:
             break
         }
@@ -542,6 +869,8 @@ struct TaskRow: View {
     var onRestore: () -> Void
     var onEdit: () -> Void
     var onDelete: () -> Void
+    var onTogglePinned: () -> Void
+    var onToggleSubtask: (SubtaskItem) -> Void
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
@@ -554,10 +883,18 @@ struct TaskRow: View {
             .help(task.done ? "Restore" : "Complete")
 
             VStack(alignment: .leading, spacing: 6) {
-                Text(task.title)
-                    .font(.headline)
-                    .strikethrough(task.done)
-                    .foregroundStyle(task.done ? .secondary : .primary)
+                HStack(spacing: 6) {
+                    if task.isPinned {
+                        Image(systemName: "pin.fill")
+                            .font(.caption.bold())
+                            .foregroundStyle(Color(red: 0.62, green: 0.86, blue: 0.88))
+                    }
+
+                    Text(task.title)
+                        .font(.headline)
+                        .strikethrough(task.done)
+                        .foregroundStyle(task.done ? .secondary : .primary)
+                }
 
                 if let notes = task.notes, !notes.isEmpty {
                     Text(notes)
@@ -571,15 +908,49 @@ struct TaskRow: View {
                     if let deadline = task.deadline {
                         Label(deadline.formatted(date: .abbreviated, time: .shortened), systemImage: "calendar")
                     }
+                    if let recurrence = task.recurrence {
+                        Label(recurrence.title, systemImage: recurrence.symbol)
+                    }
+                    if let subtaskProgressText = task.subtaskProgressText {
+                        Label(subtaskProgressText, systemImage: "checklist")
+                    }
                     Label(task.createdAt.formatted(date: .abbreviated, time: .omitted), systemImage: "plus.circle")
                 }
                 .font(.caption)
                 .foregroundStyle(.secondary)
+
+                if !task.taskSubtasks.isEmpty {
+                    VStack(alignment: .leading, spacing: 5) {
+                        ForEach(task.taskSubtasks) { subtask in
+                            Button {
+                                onToggleSubtask(subtask)
+                            } label: {
+                                HStack(spacing: 6) {
+                                    Image(systemName: subtask.done ? "checkmark.circle.fill" : "circle")
+                                        .foregroundStyle(subtask.done ? .green : Color(red: 0.62, green: 0.86, blue: 0.88))
+                                    Text(subtask.title)
+                                        .strikethrough(subtask.done)
+                                        .foregroundStyle(subtask.done ? .secondary : .primary)
+                                        .lineLimit(1)
+                                }
+                                .font(.callout)
+                            }
+                            .buttonStyle(.plain)
+                            .help(subtask.done ? "Restore subtask" : "Complete subtask")
+                        }
+                    }
+                    .padding(.top, 4)
+                }
             }
 
             Spacer(minLength: 12)
 
             HStack(spacing: 6) {
+                Button(action: onTogglePinned) {
+                    Image(systemName: task.isPinned ? "pin.fill" : "pin")
+                }
+                .help(task.isPinned ? "Unpin" : "Pin")
+
                 Button(action: onEdit) {
                     Image(systemName: "pencil")
                 }
@@ -600,6 +971,7 @@ struct TaskRow: View {
 
 struct TaskEditSheet: View {
     @State var draft: TaskDraft
+    @State private var newSubtaskTitle = ""
     var onSave: (TaskDraft) -> Void
     var onCancel: () -> Void
 
@@ -618,6 +990,40 @@ struct TaskEditSheet: View {
             VStack(alignment: .leading, spacing: 14) {
                 DueDateControl(isEnabled: $draft.hasDeadline, date: $draft.deadline)
                 PriorityPicker(priority: $draft.priority)
+                RecurrencePicker(recurrence: $draft.recurrence, isEnabled: draft.hasDeadline)
+                PinToggle(isPinned: $draft.pinned)
+            }
+
+            VStack(alignment: .leading, spacing: 10) {
+                Label("Subtasks", systemImage: "checklist")
+                    .font(.headline)
+
+                ForEach($draft.subtasks) { $subtask in
+                    HStack(spacing: 8) {
+                        Toggle("", isOn: $subtask.done)
+                            .labelsHidden()
+                            .toggleStyle(.checkbox)
+                        TextField("Subtask", text: $subtask.title)
+                            .textFieldStyle(.roundedBorder)
+                        Button(role: .destructive) {
+                            draft.subtasks.removeAll { $0.id == subtask.id }
+                        } label: {
+                            Image(systemName: "trash")
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Delete subtask")
+                    }
+                }
+
+                HStack(spacing: 8) {
+                    TextField("Add subtask", text: $newSubtaskTitle)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit(addSubtask)
+                    Button(action: addSubtask) {
+                        Label("Add", systemImage: "plus")
+                    }
+                    .disabled(newSubtaskTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
             }
 
             HStack {
@@ -625,14 +1031,42 @@ struct TaskEditSheet: View {
                 Button("Cancel", action: onCancel)
                     .keyboardShortcut(.cancelAction)
                 Button("Save") {
-                    onSave(draft)
+                    saveDraft()
                 }
                 .keyboardShortcut(.defaultAction)
                 .disabled(draft.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }
         .padding(24)
-        .frame(width: 460)
+        .frame(width: 520)
+    }
+
+    private func addSubtask() {
+        let trimmed = newSubtaskTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        draft.subtasks.append(SubtaskItem(
+            id: UUID().uuidString,
+            title: trimmed,
+            done: false,
+            createdAt: Date(),
+            updatedAt: nil
+        ))
+        newSubtaskTitle = ""
+    }
+
+    private func saveDraft() {
+        draft.subtasks = draft.subtasks.compactMap { subtask in
+            let trimmed = subtask.title.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return nil }
+            var cleaned = subtask
+            cleaned.title = trimmed
+            cleaned.updatedAt = Date()
+            return cleaned
+        }
+        if !draft.hasDeadline {
+            draft.recurrence = nil
+        }
+        onSave(draft)
     }
 }
 
@@ -645,6 +1079,7 @@ struct DueDateControl: View {
         HStack(spacing: 10) {
             Toggle("Deadline", isOn: $isEnabled)
                 .toggleStyle(.checkbox)
+                .fixedSize()
 
             if isEnabled {
                 Button {
@@ -741,6 +1176,119 @@ struct PriorityPicker: View {
             .frame(width: 190)
         }
         .frame(minWidth: 280, alignment: .leading)
+    }
+}
+
+struct RecurrencePicker: View {
+    @Binding var recurrence: TaskRecurrence?
+    var isEnabled: Bool
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Label("Repeats", systemImage: "repeat")
+                .foregroundStyle(isEnabled ? .secondary : .tertiary)
+                .lineLimit(1)
+                .fixedSize()
+
+            Picker("", selection: $recurrence) {
+                Text("None").tag(TaskRecurrence?.none)
+                ForEach(TaskRecurrence.allCases) { recurrence in
+                    Text(recurrence.title)
+                        .tag(Optional(recurrence))
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.segmented)
+            .frame(width: 240)
+            .disabled(!isEnabled)
+            .onChange(of: isEnabled) { _, enabled in
+                if !enabled {
+                    recurrence = nil
+                }
+            }
+        }
+        .frame(minWidth: 330, alignment: .leading)
+    }
+}
+
+struct PinToggle: View {
+    @Binding var isPinned: Bool
+
+    var body: some View {
+        Toggle(isOn: $isPinned) {
+            Label("Pin", systemImage: isPinned ? "pin.fill" : "pin")
+        }
+        .toggleStyle(.checkbox)
+    }
+}
+
+struct NotificationSettingsSheet: View {
+    @State private var draft: NotificationSettings
+    var onSave: (NotificationSettings) -> Void
+    var onCancel: () -> Void
+
+    init(
+        settings: NotificationSettings,
+        onSave: @escaping (NotificationSettings) -> Void,
+        onCancel: @escaping () -> Void
+    ) {
+        _draft = State(initialValue: settings)
+        self.onSave = onSave
+        self.onCancel = onCancel
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Text("Notifications")
+                .font(.title.bold())
+
+            Toggle("Notifications", isOn: $draft.enabled)
+                .toggleStyle(.switch)
+
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Default reminders")
+                    .font(.headline)
+
+                ForEach(ReminderOffset.allCases) { offset in
+                    Toggle(offset.title, isOn: reminderBinding(for: offset))
+                        .toggleStyle(.checkbox)
+                        .disabled(!draft.enabled)
+                }
+            }
+
+            HStack {
+                Spacer()
+                Button("Cancel", action: onCancel)
+                    .keyboardShortcut(.cancelAction)
+                Button("Save") {
+                    if draft.enabled && draft.reminderOffsets.isEmpty {
+                        draft.reminderOffsets = [.oneHour]
+                    }
+                    draft.reminderOffsets.sort { $0.rawValue < $1.rawValue }
+                    onSave(draft)
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(24)
+        .frame(width: 360)
+    }
+
+    private func reminderBinding(for offset: ReminderOffset) -> Binding<Bool> {
+        Binding(
+            get: {
+                draft.reminderOffsets.contains(offset)
+            },
+            set: { enabled in
+                if enabled {
+                    if !draft.reminderOffsets.contains(offset) {
+                        draft.reminderOffsets.append(offset)
+                    }
+                } else {
+                    draft.reminderOffsets.removeAll { $0 == offset }
+                }
+            }
+        )
     }
 }
 

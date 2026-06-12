@@ -14,6 +14,10 @@ Feel free to download it, use it, fork it, and contribute.
 - Add, edit, delete, complete, and restore tasks.
 - Optional deadlines with a compact date/time popover.
 - Low, Normal, and High priority options.
+- Global notification defaults for deadline reminders.
+- One-level subtasks with completion tracking.
+- Daily, weekly, and monthly recurring tasks.
+- Pinned tasks that stay above the regular list.
 - Widget shows open tasks only, plus progress for what is currently active.
 - Completing from the widget opens the app for confirmation before the task is cleared.
 - No account, no cloud service, no subscription.
@@ -25,6 +29,7 @@ Most to-do apps are either full productivity suites or they do not behave like a
 - It is built around the desktop widget first.
 - It keeps the widget readable and minimal instead of busy.
 - It keeps completed tasks out of the widget so the desktop stays clean.
+- It can show pinned tasks, priority, and subtasks without turning the widget into a dashboard.
 - It gives the full app enough tools to manage tasks without turning into a project-management app.
 - It is open source, so anyone can improve it.
 

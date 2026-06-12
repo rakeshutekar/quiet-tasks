@@ -1,6 +1,14 @@
 import SwiftUI
 import WidgetKit
 
+struct SubtaskItem: Codable, Identifiable, Equatable {
+    var id: String
+    var title: String
+    var done: Bool
+    var createdAt: Date
+    var updatedAt: Date?
+}
+
 struct TaskItem: Codable, Identifiable, Equatable {
     var id: String
     var title: String
@@ -11,9 +19,29 @@ struct TaskItem: Codable, Identifiable, Equatable {
     var priority: TaskPriority?
     var updatedAt: Date?
     var completedAt: Date?
+    var subtasks: [SubtaskItem]? = nil
+    var recurrence: TaskRecurrence? = nil
+    var pinned: Bool? = nil
 
     var taskPriority: TaskPriority {
         priority ?? .normal
+    }
+
+    var taskSubtasks: [SubtaskItem] {
+        subtasks ?? []
+    }
+
+    var isPinned: Bool {
+        pinned ?? false
+    }
+
+    var completedSubtaskCount: Int {
+        taskSubtasks.filter(\.done).count
+    }
+
+    var subtaskProgressText: String? {
+        guard !taskSubtasks.isEmpty else { return nil }
+        return "\(completedSubtaskCount)/\(taskSubtasks.count)"
     }
 }
 
@@ -45,6 +73,22 @@ enum TaskPriority: String, CaseIterable, Codable, Identifiable {
         case .low: "arrow.down"
         case .normal: "equal"
         case .high: "exclamationmark"
+        }
+    }
+}
+
+enum TaskRecurrence: String, CaseIterable, Codable, Identifiable {
+    case daily
+    case weekly
+    case monthly
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .daily: "Daily"
+        case .weekly: "Weekly"
+        case .monthly: "Monthly"
         }
     }
 }
@@ -103,6 +147,7 @@ struct QuietTasksWidgetView: View {
 
     private var openTasks: [TaskItem] {
         entry.tasks.filter { !$0.done }.sorted { lhs, rhs in
+            if lhs.isPinned != rhs.isPinned { return lhs.isPinned }
             if lhs.taskPriority.rank != rhs.taskPriority.rank { return lhs.taskPriority.rank < rhs.taskPriority.rank }
             switch (lhs.deadline, rhs.deadline) {
             case let (left?, right?) where left != right:
@@ -226,6 +271,12 @@ struct QuietTasksWidgetView: View {
 
             VStack(alignment: .leading, spacing: compact ? 3 : 4) {
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    if task.isPinned {
+                        Image(systemName: "pin.fill")
+                            .font(.system(size: compact ? 7 : 8, weight: .bold))
+                            .foregroundStyle(Color(red: 0.62, green: 0.86, blue: 0.88))
+                    }
+
                     WidgetPriorityBadge(priority: task.taskPriority, compact: compact)
 
                     Text(task.title)
@@ -234,11 +285,43 @@ struct QuietTasksWidgetView: View {
                         .lineLimit(compact ? 1 : 2)
                 }
 
-                if !compact, let deadline = task.deadline {
-                    Text(deadline.formatted(date: .abbreviated, time: .shortened))
-                        .font(.caption2)
-                        .foregroundStyle(.white.opacity(0.56))
-                        .lineLimit(1)
+                if !compact {
+                    HStack(spacing: 7) {
+                        if let deadline = task.deadline {
+                            Text(deadline.formatted(date: .abbreviated, time: .shortened))
+                        }
+                        if let recurrence = task.recurrence {
+                            Label(recurrence.title, systemImage: "repeat")
+                        }
+                        if let progress = task.subtaskProgressText {
+                            Label(progress, systemImage: "checklist")
+                        }
+                    }
+                    .font(.caption2)
+                    .foregroundStyle(.white.opacity(0.56))
+                    .lineLimit(1)
+                } else if let progress = task.subtaskProgressText {
+                    Text(progress)
+                        .font(.system(size: 8, weight: .bold))
+                        .foregroundStyle(.white.opacity(0.5))
+                }
+
+                if !compact && !task.taskSubtasks.isEmpty {
+                    VStack(alignment: .leading, spacing: 3) {
+                        ForEach(Array(task.taskSubtasks.prefix(2))) { subtask in
+                            Link(destination: subtaskURL(task: task, subtask: subtask)) {
+                                HStack(spacing: 5) {
+                                    Image(systemName: subtask.done ? "checkmark.circle.fill" : "circle")
+                                        .font(.system(size: 9, weight: .bold))
+                                    Text(subtask.title)
+                                        .strikethrough(subtask.done)
+                                        .lineLimit(1)
+                                }
+                                .font(.caption2)
+                                .foregroundStyle(subtask.done ? .white.opacity(0.42) : .white.opacity(0.7))
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -252,6 +335,17 @@ struct QuietTasksWidgetView: View {
         components.scheme = "quiettasks"
         components.host = "complete"
         components.queryItems = [URLQueryItem(name: "id", value: task.id)]
+        return components.url!
+    }
+
+    private func subtaskURL(task: TaskItem, subtask: SubtaskItem) -> URL {
+        var components = URLComponents()
+        components.scheme = "quiettasks"
+        components.host = "subtask"
+        components.queryItems = [
+            URLQueryItem(name: "task", value: task.id),
+            URLQueryItem(name: "subtask", value: subtask.id)
+        ]
         return components.url!
     }
 }
