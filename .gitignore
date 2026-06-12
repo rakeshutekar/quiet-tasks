@@ -1,0 +1,28 @@
+.DS_Store
+
+# Xcode user state
+xcuserdata/
+*.xcuserstate
+*.xcscmblueprint
+
+# Build output
+build/
+DerivedData/
+XcodeDerivedData/
+*.dSYM/
+*.xcresult/
+
+# Packaged apps and archives
+*.app/
+*.appex/
+*.ipa
+*.pkg
+*.dmg
+
+# Swift Package Manager scratch data, if added later
+.build/
+.swiftpm/
+
+# Local notes
+.env
+.env.*
