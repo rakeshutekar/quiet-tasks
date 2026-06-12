@@ -100,7 +100,7 @@ enum TaskStore {
         return try? JSONDecoder.taskDecoder.decode([TaskItem].self, from: data)
     }
 
-    private static func normalized(_ tasks: [TaskItem]) -> [TaskItem] {
+    static func normalized(_ tasks: [TaskItem]) -> [TaskItem] {
         tasks.sorted { lhs, rhs in
             if lhs.done != rhs.done { return !lhs.done }
             if lhs.taskPriority.rank != rhs.taskPriority.rank { return lhs.taskPriority.rank < rhs.taskPriority.rank }
@@ -281,6 +281,7 @@ final class TaskModel: ObservableObject {
     }
 
     private func persist() {
+        tasks = TaskStore.normalized(tasks)
         TaskStore.save(tasks)
     }
 }

@@ -39,6 +39,14 @@ enum TaskPriority: String, CaseIterable, Codable, Identifiable {
         case .low: 2
         }
     }
+
+    var symbol: String {
+        switch self {
+        case .low: "arrow.down"
+        case .normal: "equal"
+        case .high: "exclamationmark"
+        }
+    }
 }
 
 enum TaskStore {
@@ -216,24 +224,21 @@ struct QuietTasksWidgetView: View {
                     .foregroundStyle(Color(red: 0.62, green: 0.86, blue: 0.88))
             }
 
-            VStack(alignment: .leading, spacing: 1) {
-                Text(task.title)
-                    .font(compact ? .caption.bold() : .headline)
-                    .foregroundStyle(Color(red: 0.62, green: 0.86, blue: 0.88))
-                    .lineLimit(compact ? 1 : 2)
+            VStack(alignment: .leading, spacing: compact ? 3 : 4) {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    WidgetPriorityBadge(priority: task.taskPriority, compact: compact)
 
-                if !compact {
-                    HStack(spacing: 6) {
-                        if task.taskPriority != .normal {
-                            Text(task.taskPriority.title)
-                        }
-                        if let deadline = task.deadline {
-                            Text(deadline.formatted(date: .abbreviated, time: .shortened))
-                        }
-                    }
-                    .font(.caption2)
-                    .foregroundStyle(.white.opacity(0.56))
-                    .lineLimit(1)
+                    Text(task.title)
+                        .font(compact ? .caption.bold() : .headline)
+                        .foregroundStyle(Color(red: 0.62, green: 0.86, blue: 0.88))
+                        .lineLimit(compact ? 1 : 2)
+                }
+
+                if !compact, let deadline = task.deadline {
+                    Text(deadline.formatted(date: .abbreviated, time: .shortened))
+                        .font(.caption2)
+                        .foregroundStyle(.white.opacity(0.56))
+                        .lineLimit(1)
                 }
             }
         }
@@ -248,6 +253,36 @@ struct QuietTasksWidgetView: View {
         components.host = "complete"
         components.queryItems = [URLQueryItem(name: "id", value: task.id)]
         return components.url!
+    }
+}
+
+struct WidgetPriorityBadge: View {
+    var priority: TaskPriority
+    var compact: Bool
+
+    var body: some View {
+        HStack(spacing: 3) {
+            Image(systemName: priority.symbol)
+                .font(.system(size: compact ? 7 : 8, weight: .bold))
+            Text(priority.title)
+                .font(.system(size: compact ? 8 : 9, weight: .bold))
+        }
+        .foregroundStyle(priorityColor)
+        .padding(.horizontal, compact ? 5 : 6)
+        .padding(.vertical, compact ? 2 : 3)
+        .background(priorityColor.opacity(0.14), in: Capsule())
+        .lineLimit(1)
+    }
+
+    private var priorityColor: Color {
+        switch priority {
+        case .high:
+            Color(red: 0.98, green: 0.58, blue: 0.45)
+        case .normal:
+            Color(red: 0.62, green: 0.86, blue: 0.88)
+        case .low:
+            Color.white.opacity(0.62)
+        }
     }
 }
 
