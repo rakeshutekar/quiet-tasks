@@ -42,6 +42,16 @@ The current local development build stores shared app/widget data at:
 
 That lets an unsigned local app and WidgetKit extension share task data during development. A production-distributed version should move this to a signed App Group.
 
+## Download
+
+The latest downloadable build is available from GitHub Releases:
+
+```text
+https://github.com/rakeshutekar/quiet-tasks/releases
+```
+
+Current builds are unsigned development builds. If macOS blocks the app after download, open **System Settings -> Privacy & Security** and allow it, or build from source with Xcode.
+
 ## Install From Source
 
 Clone the repo:
