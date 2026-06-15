@@ -321,6 +321,7 @@ struct QuietTasksWidgetView: View {
                 Spacer(minLength: 0)
             }
         }
+        .widgetAccentable(false)
         .containerBackground(palette.background, for: .widget)
     }
 
@@ -537,5 +538,6 @@ struct QuietTasksWidget: Widget {
         .configurationDisplayName("Quiet Tasks")
         .description("Shows open Quiet Tasks on the desktop.")
         .supportedFamilies([.systemSmall, .systemMedium, .systemLarge])
+        .containerBackgroundRemovable(false)
     }
 }

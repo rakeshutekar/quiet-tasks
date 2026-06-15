@@ -909,6 +909,7 @@ final class TaskModel: ObservableObject {
         tasks = TaskStore.load()
         settings = SettingsStore.load()
         NotificationScheduler.sync(tasks: tasks, settings: notificationSettings)
+        WidgetCenter.shared.reloadAllTimelines()
     }
 
     var openTasks: [TaskItem] {
@@ -936,6 +937,7 @@ final class TaskModel: ObservableObject {
         tasks = TaskStore.load()
         settings = SettingsStore.load()
         NotificationScheduler.sync(tasks: tasks, settings: notificationSettings)
+        WidgetCenter.shared.reloadAllTimelines()
     }
 
     func add(
@@ -1116,6 +1118,7 @@ final class TaskModel: ObservableObject {
     func updateAppearance(_ appearance: AppearanceMode) {
         settings.appearance = appearance
         SettingsStore.save(settings)
+        WidgetCenter.shared.reloadAllTimelines()
     }
 
     func updateGoogleSettings(_ googleSettings: GoogleSyncSettings) {
