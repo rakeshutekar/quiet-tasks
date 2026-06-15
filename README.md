@@ -18,9 +18,11 @@ Feel free to download it, use it, fork it, and contribute.
 - One-level subtasks with completion tracking.
 - Daily, weekly, and monthly recurring tasks.
 - Pinned tasks that stay above the regular list.
+- System, light, and dark appearance modes for the app and widget.
+- Optional Google Tasks read-only sync for showing Google task lists in Quiet Tasks.
 - Widget shows open tasks only, plus progress for what is currently active.
 - Completing from the widget opens the app for confirmation before the task is cleared.
-- No account, no cloud service, no subscription.
+- No account or cloud service required for local tasks.
 
 ## Why This Is Better
 
@@ -56,6 +58,31 @@ https://github.com/rakeshutekar/quiet-tasks/releases
 ```
 
 Current builds are unsigned development builds. If macOS blocks the app after download, open **System Settings -> Privacy & Security** and allow it, or build from source with Xcode.
+
+## Google Tasks Read-Only Sync
+
+Quiet Tasks can import tasks from one Google Tasks list and show them in the app and widget. This first version is read-only: edits, completions, and deletes must still happen in Google Tasks.
+
+To use it:
+
+1. Create an OAuth client in Google Cloud for an installed/native app.
+2. Add this redirect URI:
+
+```text
+com.rakeshutekar.quiettasks:/oauth2redirect
+```
+
+3. Open **Quiet Tasks -> Settings -> Google Tasks**.
+4. Paste the OAuth client ID.
+5. Connect Google, choose a task list, then click **Sync Now**.
+
+Quiet Tasks requests the read-only Google Tasks scope:
+
+```text
+https://www.googleapis.com/auth/tasks.readonly
+```
+
+Google Tasks due dates are date-only. If a Google task has a due date, Quiet Tasks shows the date without an exact time.
 
 ## Install From Source
 
@@ -134,6 +161,7 @@ Contributions are welcome. Useful areas to improve:
 - Signed release packaging.
 - App Group storage for production signing.
 - Keyboard shortcuts.
+- Two-way Google Tasks sync.
 - Better recurring tasks.
 - iCloud sync as an optional feature.
 - More widget configuration options while keeping the default UI quiet.

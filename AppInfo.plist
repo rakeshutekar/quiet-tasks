@@ -26,6 +26,7 @@
       <key>CFBundleURLSchemes</key>
       <array>
         <string>quiettasks</string>
+        <string>com.rakeshutekar.quiettasks</string>
       </array>
     </dict>
   </array>

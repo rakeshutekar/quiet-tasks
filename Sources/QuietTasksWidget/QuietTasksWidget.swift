@@ -22,6 +22,11 @@ struct TaskItem: Codable, Identifiable, Equatable {
     var subtasks: [SubtaskItem]? = nil
     var recurrence: TaskRecurrence? = nil
     var pinned: Bool? = nil
+    var source: TaskSource? = nil
+    var externalID: String? = nil
+    var externalListID: String? = nil
+    var externalUpdatedAt: Date? = nil
+    var deadlineHasTime: Bool? = nil
 
     var taskPriority: TaskPriority {
         priority ?? .normal
@@ -35,6 +40,14 @@ struct TaskItem: Codable, Identifiable, Equatable {
         pinned ?? false
     }
 
+    var isGoogleTask: Bool {
+        source == .google
+    }
+
+    var showsDeadlineTime: Bool {
+        deadlineHasTime ?? true
+    }
+
     var completedSubtaskCount: Int {
         taskSubtasks.filter(\.done).count
     }
@@ -43,6 +56,10 @@ struct TaskItem: Codable, Identifiable, Equatable {
         guard !taskSubtasks.isEmpty else { return nil }
         return "\(completedSubtaskCount)/\(taskSubtasks.count)"
     }
+}
+
+enum TaskSource: String, Codable, Equatable {
+    case google
 }
 
 enum TaskPriority: String, CaseIterable, Codable, Identifiable {
@@ -93,6 +110,33 @@ enum TaskRecurrence: String, CaseIterable, Codable, Identifiable {
     }
 }
 
+enum AppearanceMode: String, CaseIterable, Codable, Identifiable {
+    case system
+    case light
+    case dark
+
+    var id: String { rawValue }
+}
+
+struct NotificationSettings: Codable, Equatable {
+    var enabled: Bool
+    var reminderOffsets: [Int]?
+}
+
+struct GoogleSyncSettings: Codable, Equatable {
+    var clientID: String?
+    var isConnected: Bool?
+    var selectedTaskListID: String?
+    var selectedTaskListTitle: String?
+    var lastSyncedAt: Date?
+}
+
+struct AppSettings: Codable, Equatable {
+    var notifications: NotificationSettings?
+    var appearance: AppearanceMode?
+    var googleSync: GoogleSyncSettings?
+}
+
 enum TaskStore {
     static var fileURL: URL {
         sharedDirectory.appendingPathComponent("tasks.json")
@@ -110,6 +154,22 @@ enum TaskStore {
     }
 }
 
+enum WidgetSettingsStore {
+    static var fileURL: URL {
+        URL(fileURLWithPath: "/Users/Shared/QuietTasks", isDirectory: true)
+            .appendingPathComponent("settings.json")
+    }
+
+    static func loadAppearance() -> AppearanceMode {
+        guard let data = try? Data(contentsOf: fileURL),
+              let settings = try? JSONDecoder.taskDecoder.decode(AppSettings.self, from: data)
+        else {
+            return .system
+        }
+        return settings.appearance ?? .system
+    }
+}
+
 extension JSONDecoder {
     static var taskDecoder: JSONDecoder {
         let decoder = JSONDecoder()
@@ -121,6 +181,7 @@ extension JSONDecoder {
 struct QuietEntry: TimelineEntry {
     let date: Date
     let tasks: [TaskItem]
+    let appearance: AppearanceMode
 }
 
 struct Provider: TimelineProvider {
@@ -128,22 +189,69 @@ struct Provider: TimelineProvider {
         QuietEntry(date: Date(), tasks: [
             TaskItem(id: "1", title: "Plan sprint review", deadline: Date(), done: false, createdAt: Date(), notes: nil, priority: .high, updatedAt: nil, completedAt: nil),
             TaskItem(id: "2", title: "Send design notes", deadline: nil, done: false, createdAt: Date(), notes: nil, priority: .normal, updatedAt: nil, completedAt: nil)
-        ])
+        ], appearance: WidgetSettingsStore.loadAppearance())
     }
 
     func getSnapshot(in context: Context, completion: @escaping (QuietEntry) -> Void) {
-        completion(QuietEntry(date: Date(), tasks: TaskStore.load()))
+        completion(QuietEntry(date: Date(), tasks: TaskStore.load(), appearance: WidgetSettingsStore.loadAppearance()))
     }
 
     func getTimeline(in context: Context, completion: @escaping (Timeline<QuietEntry>) -> Void) {
-        let entry = QuietEntry(date: Date(), tasks: TaskStore.load())
+        let entry = QuietEntry(
+            date: Date(),
+            tasks: TaskStore.load(),
+            appearance: WidgetSettingsStore.loadAppearance()
+        )
         completion(Timeline(entries: [entry], policy: .after(Date().addingTimeInterval(30))))
+    }
+}
+
+struct WidgetPalette {
+    var background: Color
+    var surface: Color
+    var primaryText: Color
+    var secondaryText: Color
+    var mutedText: Color
+    var accent: Color
+    var warning: Color
+    var danger: Color
+
+    static func palette(appearance: AppearanceMode, colorScheme: ColorScheme) -> WidgetPalette {
+        let useLight = appearance == .light || (appearance == .system && colorScheme == .light)
+        if useLight {
+            return WidgetPalette(
+                background: Color(red: 0.93, green: 0.95, blue: 0.93),
+                surface: Color.white.opacity(0.72),
+                primaryText: Color(red: 0.12, green: 0.14, blue: 0.13),
+                secondaryText: Color(red: 0.29, green: 0.36, blue: 0.34),
+                mutedText: Color(red: 0.45, green: 0.50, blue: 0.48),
+                accent: Color(red: 0.18, green: 0.48, blue: 0.52),
+                warning: Color(red: 0.78, green: 0.33, blue: 0.20),
+                danger: Color(red: 0.83, green: 0.19, blue: 0.28)
+            )
+        }
+
+        return WidgetPalette(
+            background: Color(red: 0.12, green: 0.13, blue: 0.12),
+            surface: Color.white.opacity(0.06),
+            primaryText: .white,
+            secondaryText: Color.white.opacity(0.72),
+            mutedText: Color.white.opacity(0.56),
+            accent: Color(red: 0.62, green: 0.86, blue: 0.88),
+            warning: Color(red: 0.98, green: 0.58, blue: 0.45),
+            danger: Color(red: 1.0, green: 0.28, blue: 0.36)
+        )
     }
 }
 
 struct QuietTasksWidgetView: View {
     var entry: QuietEntry
     @Environment(\.widgetFamily) private var family
+    @Environment(\.colorScheme) private var colorScheme
+
+    private var palette: WidgetPalette {
+        WidgetPalette.palette(appearance: entry.appearance, colorScheme: colorScheme)
+    }
 
     private var openTasks: [TaskItem] {
         entry.tasks.filter { !$0.done }.sorted { lhs, rhs in
@@ -195,7 +303,7 @@ struct QuietTasksWidgetView: View {
                 Spacer()
                 Text("No open tasks")
                     .font(compact ? .caption.bold() : .headline)
-                    .foregroundStyle(.white.opacity(0.58))
+                    .foregroundStyle(palette.mutedText)
                     .frame(maxWidth: .infinity)
                 Spacer()
             } else {
@@ -207,13 +315,13 @@ struct QuietTasksWidgetView: View {
                     if openTasks.count > taskLimit {
                         Text("+ \(openTasks.count - taskLimit) more")
                             .font(.caption.bold())
-                            .foregroundStyle(.white.opacity(0.55))
+                            .foregroundStyle(palette.mutedText)
                     }
                 }
                 Spacer(minLength: 0)
             }
         }
-        .containerBackground(Color(red: 0.12, green: 0.13, blue: 0.12), for: .widget)
+        .containerBackground(palette.background, for: .widget)
     }
 
     private func header(compact: Bool) -> some View {
@@ -221,21 +329,21 @@ struct QuietTasksWidgetView: View {
             VStack(alignment: .leading, spacing: compact ? 1 : 2) {
                 Text(entry.date.formatted(.dateTime.weekday(.wide).month(.abbreviated).day()))
                     .font(compact ? .system(size: 9, weight: .bold) : .caption.bold())
-                    .foregroundStyle(Color(red: 1.0, green: 0.28, blue: 0.36))
+                    .foregroundStyle(palette.danger)
                     .textCase(.uppercase)
                     .lineLimit(1)
                 Text("Tasks")
                     .font(compact ? .title2.bold() : .title.bold())
-                    .foregroundStyle(.white)
+                    .foregroundStyle(palette.primaryText)
                     .lineLimit(1)
             }
             Spacer(minLength: 4)
             Link(destination: URL(string: "quiettasks://add")!) {
                 Image(systemName: "plus")
                     .font(compact ? .headline.bold() : .title2.bold())
-                    .foregroundStyle(Color(red: 0.62, green: 0.86, blue: 0.88))
+                    .foregroundStyle(palette.accent)
                     .frame(width: compact ? 32 : 38, height: compact ? 32 : 38)
-                    .background(.white.opacity(0.08), in: Circle())
+                    .background(palette.surface, in: Circle())
             }
         }
     }
@@ -245,28 +353,28 @@ struct QuietTasksWidgetView: View {
             Text("\(displayCompletedCount) / \(displayTotalCount) done")
                 .font(.caption.bold())
                 .monospacedDigit()
-                .foregroundStyle(Color(red: 0.62, green: 0.86, blue: 0.88))
+                .foregroundStyle(palette.accent)
             GeometryReader { proxy in
                 ZStack(alignment: .leading) {
                     Capsule()
-                        .fill(.white.opacity(0.16))
+                        .fill(palette.mutedText.opacity(0.25))
                     Capsule()
-                        .fill(Color(red: 0.62, green: 0.86, blue: 0.88))
+                        .fill(palette.accent)
                         .frame(width: max(5, proxy.size.width * progress))
                 }
             }
             .frame(height: compact ? 5 : 6)
         }
         .padding(compact ? 9 : 10)
-        .background(.white.opacity(0.06), in: RoundedRectangle(cornerRadius: compact ? 10 : 12, style: .continuous))
+        .background(palette.surface, in: RoundedRectangle(cornerRadius: compact ? 10 : 12, style: .continuous))
     }
 
     private func taskRow(_ task: TaskItem, compact: Bool) -> some View {
         HStack(alignment: .top, spacing: compact ? 6 : 8) {
-            Link(destination: completeURL(for: task)) {
+            Link(destination: task.isGoogleTask ? googleURL(for: task) : completeURL(for: task)) {
                 Image(systemName: "circle")
                     .font(compact ? .caption.bold() : .callout.bold())
-                    .foregroundStyle(Color(red: 0.62, green: 0.86, blue: 0.88))
+                    .foregroundStyle(palette.accent)
             }
 
             VStack(alignment: .leading, spacing: compact ? 3 : 4) {
@@ -274,21 +382,25 @@ struct QuietTasksWidgetView: View {
                     if task.isPinned {
                         Image(systemName: "pin.fill")
                             .font(.system(size: compact ? 7 : 8, weight: .bold))
-                            .foregroundStyle(Color(red: 0.62, green: 0.86, blue: 0.88))
+                            .foregroundStyle(palette.accent)
                     }
 
-                    WidgetPriorityBadge(priority: task.taskPriority, compact: compact)
+                    if task.isGoogleTask {
+                        WidgetSourceBadge(compact: compact, palette: palette)
+                    } else {
+                        WidgetPriorityBadge(priority: task.taskPriority, compact: compact, palette: palette)
+                    }
 
                     Text(task.title)
                         .font(compact ? .caption.bold() : .headline)
-                        .foregroundStyle(Color(red: 0.62, green: 0.86, blue: 0.88))
+                        .foregroundStyle(palette.accent)
                         .lineLimit(compact ? 1 : 2)
                 }
 
                 if !compact {
                     HStack(spacing: 7) {
                         if let deadline = task.deadline {
-                            Text(deadline.formatted(date: .abbreviated, time: .shortened))
+                            Text(deadlineText(deadline, for: task))
                         }
                         if let recurrence = task.recurrence {
                             Label(recurrence.title, systemImage: "repeat")
@@ -298,18 +410,18 @@ struct QuietTasksWidgetView: View {
                         }
                     }
                     .font(.caption2)
-                    .foregroundStyle(.white.opacity(0.56))
+                    .foregroundStyle(palette.mutedText)
                     .lineLimit(1)
                 } else if let progress = task.subtaskProgressText {
                     Text(progress)
                         .font(.system(size: 8, weight: .bold))
-                        .foregroundStyle(.white.opacity(0.5))
+                        .foregroundStyle(palette.mutedText)
                 }
 
                 if !compact && !task.taskSubtasks.isEmpty {
                     VStack(alignment: .leading, spacing: 3) {
                         ForEach(Array(task.taskSubtasks.prefix(2))) { subtask in
-                            Link(destination: subtaskURL(task: task, subtask: subtask)) {
+                            Link(destination: task.isGoogleTask ? googleURL(for: task) : subtaskURL(task: task, subtask: subtask)) {
                                 HStack(spacing: 5) {
                                     Image(systemName: subtask.done ? "checkmark.circle.fill" : "circle")
                                         .font(.system(size: 9, weight: .bold))
@@ -318,7 +430,7 @@ struct QuietTasksWidgetView: View {
                                         .lineLimit(1)
                                 }
                                 .font(.caption2)
-                                .foregroundStyle(subtask.done ? .white.opacity(0.42) : .white.opacity(0.7))
+                                .foregroundStyle(subtask.done ? palette.mutedText.opacity(0.75) : palette.secondaryText)
                             }
                         }
                     }
@@ -327,7 +439,7 @@ struct QuietTasksWidgetView: View {
         }
         .padding(compact ? 6 : 8)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.white.opacity(0.06), in: RoundedRectangle(cornerRadius: compact ? 8 : 10, style: .continuous))
+        .background(palette.surface, in: RoundedRectangle(cornerRadius: compact ? 8 : 10, style: .continuous))
     }
 
     private func completeURL(for task: TaskItem) -> URL {
@@ -348,11 +460,27 @@ struct QuietTasksWidgetView: View {
         ]
         return components.url!
     }
+
+    private func googleURL(for task: TaskItem) -> URL {
+        var components = URLComponents()
+        components.scheme = "quiettasks"
+        components.host = "google"
+        components.queryItems = [URLQueryItem(name: "id", value: task.id)]
+        return components.url!
+    }
+
+    private func deadlineText(_ deadline: Date, for task: TaskItem) -> String {
+        if task.showsDeadlineTime {
+            return deadline.formatted(date: .abbreviated, time: .shortened)
+        }
+        return deadline.formatted(date: .abbreviated, time: .omitted)
+    }
 }
 
 struct WidgetPriorityBadge: View {
     var priority: TaskPriority
     var compact: Bool
+    var palette: WidgetPalette
 
     var body: some View {
         HStack(spacing: 3) {
@@ -371,12 +499,31 @@ struct WidgetPriorityBadge: View {
     private var priorityColor: Color {
         switch priority {
         case .high:
-            Color(red: 0.98, green: 0.58, blue: 0.45)
+            palette.warning
         case .normal:
-            Color(red: 0.62, green: 0.86, blue: 0.88)
+            palette.accent
         case .low:
-            Color.white.opacity(0.62)
+            palette.mutedText
         }
+    }
+}
+
+struct WidgetSourceBadge: View {
+    var compact: Bool
+    var palette: WidgetPalette
+
+    var body: some View {
+        HStack(spacing: 3) {
+            Image(systemName: "link")
+                .font(.system(size: compact ? 7 : 8, weight: .bold))
+            Text("Google")
+                .font(.system(size: compact ? 8 : 9, weight: .bold))
+        }
+        .foregroundStyle(palette.accent)
+        .padding(.horizontal, compact ? 5 : 6)
+        .padding(.vertical, compact ? 2 : 3)
+        .background(palette.accent.opacity(0.14), in: Capsule())
+        .lineLimit(1)
     }
 }
 

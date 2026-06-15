@@ -1,3 +1,8 @@
+import AppKit
+import AuthenticationServices
+import CryptoKit
+import Foundation
+import Security
 import SwiftUI
 import UserNotifications
 import WidgetKit
@@ -23,6 +28,11 @@ struct TaskItem: Codable, Identifiable, Equatable {
     var subtasks: [SubtaskItem]? = nil
     var recurrence: TaskRecurrence? = nil
     var pinned: Bool? = nil
+    var source: TaskSource? = nil
+    var externalID: String? = nil
+    var externalListID: String? = nil
+    var externalUpdatedAt: Date? = nil
+    var deadlineHasTime: Bool? = nil
 
     var taskPriority: TaskPriority {
         priority ?? .normal
@@ -36,6 +46,14 @@ struct TaskItem: Codable, Identifiable, Equatable {
         pinned ?? false
     }
 
+    var isGoogleTask: Bool {
+        source == .google
+    }
+
+    var showsDeadlineTime: Bool {
+        deadlineHasTime ?? true
+    }
+
     var completedSubtaskCount: Int {
         taskSubtasks.filter(\.done).count
     }
@@ -44,6 +62,10 @@ struct TaskItem: Codable, Identifiable, Equatable {
         guard !taskSubtasks.isEmpty else { return nil }
         return "\(completedSubtaskCount)/\(taskSubtasks.count) subtasks"
     }
+}
+
+enum TaskSource: String, Codable, Equatable {
+    case google
 }
 
 enum TaskPriority: String, CaseIterable, Codable, Identifiable {
@@ -146,6 +168,58 @@ struct NotificationSettings: Codable, Equatable {
     static let `default` = NotificationSettings(enabled: false, reminderOffsets: [.oneHour])
 }
 
+enum AppearanceMode: String, CaseIterable, Codable, Identifiable {
+    case system
+    case light
+    case dark
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .system: "System"
+        case .light: "Light"
+        case .dark: "Dark"
+        }
+    }
+
+    var colorScheme: ColorScheme? {
+        switch self {
+        case .system: nil
+        case .light: .light
+        case .dark: .dark
+        }
+    }
+}
+
+struct GoogleSyncSettings: Codable, Equatable {
+    var clientID: String
+    var isConnected: Bool
+    var selectedTaskListID: String?
+    var selectedTaskListTitle: String?
+    var lastSyncedAt: Date?
+
+    static let `default` = GoogleSyncSettings(
+        clientID: "",
+        isConnected: false,
+        selectedTaskListID: nil,
+        selectedTaskListTitle: nil,
+        lastSyncedAt: nil
+    )
+}
+
+struct AppSettings: Codable, Equatable {
+    var notifications: NotificationSettings
+    var appearance: AppearanceMode
+    var googleSync: GoogleSyncSettings
+
+    static let `default` = AppSettings(
+        notifications: .default,
+        appearance: .system,
+        googleSync: .default
+    )
+}
+
 enum SharedFiles {
     static var directory: URL {
         let directory = URL(fileURLWithPath: "/Users/Shared/QuietTasks", isDirectory: true)
@@ -224,21 +298,38 @@ enum SettingsStore {
         SharedFiles.directory.appendingPathComponent("settings.json")
     }
 
-    static func load() -> NotificationSettings {
-        guard let data = try? Data(contentsOf: fileURL),
-              let settings = try? JSONDecoder.taskDecoder.decode(NotificationSettings.self, from: data)
-        else {
+    static func load() -> AppSettings {
+        guard let data = try? Data(contentsOf: fileURL) else {
             return .default
         }
-        return settings.reminderOffsets.isEmpty && settings.enabled
-            ? NotificationSettings(enabled: settings.enabled, reminderOffsets: [.oneHour])
-            : settings
+
+        if let settings = try? JSONDecoder.taskDecoder.decode(AppSettings.self, from: data) {
+            return normalized(settings)
+        }
+
+        if let legacyNotifications = try? JSONDecoder.taskDecoder.decode(NotificationSettings.self, from: data) {
+            var settings = AppSettings.default
+            settings.notifications = legacyNotifications
+            return normalized(settings)
+        }
+
+        return .default
     }
 
-    static func save(_ settings: NotificationSettings) {
+    static func save(_ settings: AppSettings) {
         guard let data = try? JSONEncoder.taskEncoder.encode(settings) else { return }
         try? FileManager.default.createDirectory(at: SharedFiles.directory, withIntermediateDirectories: true)
         try? data.write(to: fileURL, options: .atomic)
+        WidgetCenter.shared.reloadAllTimelines()
+    }
+
+    private static func normalized(_ settings: AppSettings) -> AppSettings {
+        var normalized = settings
+        if normalized.notifications.enabled && normalized.notifications.reminderOffsets.isEmpty {
+            normalized.notifications.reminderOffsets = [.oneHour]
+        }
+        normalized.googleSync.clientID = normalized.googleSync.clientID.trimmingCharacters(in: .whitespacesAndNewlines)
+        return normalized
     }
 }
 
@@ -309,6 +400,472 @@ extension JSONEncoder {
     }
 }
 
+struct GoogleTaskList: Codable, Identifiable, Equatable {
+    var id: String
+    var title: String
+}
+
+struct GoogleTask: Codable, Identifiable {
+    var id: String
+    var title: String?
+    var notes: String?
+    var status: String?
+    var due: Date?
+    var updated: Date?
+    var completed: Date?
+    var parent: String?
+}
+
+struct GoogleTaskListResponse: Decodable {
+    var items: [GoogleTaskList]?
+    var nextPageToken: String?
+}
+
+struct GoogleTasksResponse: Decodable {
+    var items: [GoogleTask]?
+    var nextPageToken: String?
+}
+
+struct GoogleTokenResponse: Decodable {
+    var accessToken: String
+    var expiresIn: Int?
+    var refreshToken: String?
+    var tokenType: String?
+}
+
+struct GoogleAccessToken {
+    var value: String
+    var expiresAt: Date
+}
+
+enum GoogleSyncError: LocalizedError {
+    case missingClientID
+    case missingRefreshToken
+    case missingTaskList
+    case invalidResponse
+    case oauthCancelled
+    case apiError(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .missingClientID:
+            "Add a Google OAuth client ID first."
+        case .missingRefreshToken:
+            "Connect Google Tasks again."
+        case .missingTaskList:
+            "Choose a Google task list first."
+        case .invalidResponse:
+            "Google returned an unexpected response."
+        case .oauthCancelled:
+            "Google sign-in was cancelled."
+        case let .apiError(message):
+            message
+        }
+    }
+}
+
+enum GoogleDateParser {
+    private static let fractionalFormatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+
+    private static let standardFormatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter
+    }()
+
+    static func parse(_ value: String) -> Date? {
+        fractionalFormatter.date(from: value) ?? standardFormatter.date(from: value)
+    }
+}
+
+extension JSONDecoder {
+    static var googleDecoder: JSONDecoder {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        decoder.dateDecodingStrategy = .custom { decoder in
+            let container = try decoder.singleValueContainer()
+            let value = try container.decode(String.self)
+            if let date = GoogleDateParser.parse(value) {
+                return date
+            }
+            throw DecodingError.dataCorruptedError(
+                in: container,
+                debugDescription: "Invalid Google date: \(value)"
+            )
+        }
+        return decoder
+    }
+}
+
+enum KeychainTokenStore {
+    private static let service = "com.rakeshutekar.quiettasks.google"
+    private static let account = "refresh-token"
+
+    static func saveRefreshToken(_ token: String) throws {
+        let data = Data(token.utf8)
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account
+        ]
+        SecItemDelete(query as CFDictionary)
+
+        var item = query
+        item[kSecValueData as String] = data
+        item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
+        let status = SecItemAdd(item as CFDictionary, nil)
+        guard status == errSecSuccess else {
+            throw GoogleSyncError.apiError("Could not save Google token.")
+        }
+    }
+
+    static func loadRefreshToken() -> String? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        guard status == errSecSuccess,
+              let data = result as? Data,
+              let token = String(data: data, encoding: .utf8)
+        else {
+            return nil
+        }
+        return token
+    }
+
+    static func deleteRefreshToken() {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account
+        ]
+        SecItemDelete(query as CFDictionary)
+    }
+}
+
+final class OAuthPresentationContextProvider: NSObject, ASWebAuthenticationPresentationContextProviding {
+    func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
+        NSApplication.shared.keyWindow
+            ?? NSApplication.shared.windows.first
+            ?? ASPresentationAnchor()
+    }
+}
+
+enum GoogleOAuthClient {
+    static let scope = "https://www.googleapis.com/auth/tasks.readonly"
+    private static let redirectURI = "com.rakeshutekar.quiettasks:/oauth2redirect"
+    private static let callbackScheme = "com.rakeshutekar.quiettasks"
+    private static var currentSession: ASWebAuthenticationSession?
+    private static let presentationProvider = OAuthPresentationContextProvider()
+
+    static func authorize(clientID: String) async throws -> GoogleAccessToken {
+        let trimmedClientID = clientID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedClientID.isEmpty else { throw GoogleSyncError.missingClientID }
+
+        let verifier = pkceVerifier()
+        let challenge = pkceChallenge(for: verifier)
+        var components = URLComponents(string: "https://accounts.google.com/o/oauth2/v2/auth")!
+        components.queryItems = [
+            URLQueryItem(name: "client_id", value: trimmedClientID),
+            URLQueryItem(name: "redirect_uri", value: redirectURI),
+            URLQueryItem(name: "response_type", value: "code"),
+            URLQueryItem(name: "scope", value: scope),
+            URLQueryItem(name: "access_type", value: "offline"),
+            URLQueryItem(name: "prompt", value: "consent"),
+            URLQueryItem(name: "code_challenge", value: challenge),
+            URLQueryItem(name: "code_challenge_method", value: "S256")
+        ]
+
+        guard let authorizationURL = components.url else { throw GoogleSyncError.invalidResponse }
+        let callbackURL = try await authenticate(url: authorizationURL)
+        guard let code = URLComponents(url: callbackURL, resolvingAgainstBaseURL: false)?
+            .queryItems?
+            .first(where: { $0.name == "code" })?
+            .value
+        else {
+            throw GoogleSyncError.invalidResponse
+        }
+
+        let response = try await exchangeCode(
+            code,
+            clientID: trimmedClientID,
+            verifier: verifier
+        )
+        if let refreshToken = response.refreshToken {
+            try KeychainTokenStore.saveRefreshToken(refreshToken)
+        }
+        return GoogleAccessToken(
+            value: response.accessToken,
+            expiresAt: Date().addingTimeInterval(TimeInterval(response.expiresIn ?? 3600))
+        )
+    }
+
+    static func refreshedAccessToken(clientID: String) async throws -> GoogleAccessToken {
+        let trimmedClientID = clientID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedClientID.isEmpty else { throw GoogleSyncError.missingClientID }
+        guard let refreshToken = KeychainTokenStore.loadRefreshToken() else {
+            throw GoogleSyncError.missingRefreshToken
+        }
+
+        var request = URLRequest(url: URL(string: "https://oauth2.googleapis.com/token")!)
+        request.httpMethod = "POST"
+        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        request.httpBody = formEncoded([
+            "client_id": trimmedClientID,
+            "refresh_token": refreshToken,
+            "grant_type": "refresh_token"
+        ])
+
+        let response = try await tokenResponse(for: request)
+        return GoogleAccessToken(
+            value: response.accessToken,
+            expiresAt: Date().addingTimeInterval(TimeInterval(response.expiresIn ?? 3600))
+        )
+    }
+
+    private static func authenticate(url: URL) async throws -> URL {
+        try await withCheckedThrowingContinuation { continuation in
+            let session = ASWebAuthenticationSession(
+                url: url,
+                callbackURLScheme: callbackScheme
+            ) { callbackURL, error in
+                currentSession = nil
+                if let callbackURL {
+                    continuation.resume(returning: callbackURL)
+                    return
+                }
+
+                if let error = error as? ASWebAuthenticationSessionError,
+                   error.code == .canceledLogin {
+                    continuation.resume(throwing: GoogleSyncError.oauthCancelled)
+                    return
+                }
+
+                continuation.resume(throwing: error ?? GoogleSyncError.invalidResponse)
+            }
+            session.presentationContextProvider = presentationProvider
+            session.prefersEphemeralWebBrowserSession = false
+            currentSession = session
+            session.start()
+        }
+    }
+
+    private static func exchangeCode(
+        _ code: String,
+        clientID: String,
+        verifier: String
+    ) async throws -> GoogleTokenResponse {
+        var request = URLRequest(url: URL(string: "https://oauth2.googleapis.com/token")!)
+        request.httpMethod = "POST"
+        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        request.httpBody = formEncoded([
+            "client_id": clientID,
+            "code": code,
+            "code_verifier": verifier,
+            "grant_type": "authorization_code",
+            "redirect_uri": redirectURI
+        ])
+        return try await tokenResponse(for: request)
+    }
+
+    private static func tokenResponse(for request: URLRequest) async throws -> GoogleTokenResponse {
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw GoogleSyncError.invalidResponse
+        }
+        guard (200..<300).contains(httpResponse.statusCode) else {
+            throw GoogleSyncError.apiError(apiErrorMessage(from: data) ?? "Google sign-in failed.")
+        }
+        return try JSONDecoder.googleDecoder.decode(GoogleTokenResponse.self, from: data)
+    }
+
+    private static func pkceVerifier() -> String {
+        let characters = Array("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~")
+        return String((0..<64).compactMap { _ in characters.randomElement() })
+    }
+
+    private static func pkceChallenge(for verifier: String) -> String {
+        let digest = SHA256.hash(data: Data(verifier.utf8))
+        return Data(digest)
+            .base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+    }
+
+    private static func formEncoded(_ values: [String: String]) -> Data? {
+        let query = values
+            .map { key, value in
+                "\(urlEncode(key))=\(urlEncode(value))"
+            }
+            .joined(separator: "&")
+        return Data(query.utf8)
+    }
+
+    private static func urlEncode(_ value: String) -> String {
+        var allowed = CharacterSet.urlQueryAllowed
+        allowed.remove(charactersIn: "+&=")
+        return value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value
+    }
+
+    private static func apiErrorMessage(from data: Data) -> String? {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let error = object["error"] as? String
+        else {
+            return nil
+        }
+        if let description = object["error_description"] as? String {
+            return "\(error): \(description)"
+        }
+        return error
+    }
+}
+
+enum GoogleTasksClient {
+    static func fetchTaskLists(accessToken: String) async throws -> [GoogleTaskList] {
+        var lists: [GoogleTaskList] = []
+        var pageToken: String?
+
+        repeat {
+            var components = URLComponents(string: "https://tasks.googleapis.com/tasks/v1/users/@me/lists")!
+            components.queryItems = [
+                URLQueryItem(name: "maxResults", value: "100")
+            ]
+            if let pageToken {
+                components.queryItems?.append(URLQueryItem(name: "pageToken", value: pageToken))
+            }
+            var request = URLRequest(url: components.url!)
+            request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+            let response = try await googleResponse(GoogleTaskListResponse.self, for: request)
+            lists.append(contentsOf: response.items ?? [])
+            pageToken = response.nextPageToken
+        } while pageToken != nil
+
+        return lists.sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
+    }
+
+    static func fetchTasks(
+        accessToken: String,
+        taskListID: String,
+        taskListTitle: String?
+    ) async throws -> [TaskItem] {
+        var googleTasks: [GoogleTask] = []
+        var pageToken: String?
+
+        repeat {
+            let encodedListID = taskListID.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? taskListID
+            var components = URLComponents(string: "https://tasks.googleapis.com/tasks/v1/lists/\(encodedListID)/tasks")!
+            components.queryItems = [
+                URLQueryItem(name: "maxResults", value: "100"),
+                URLQueryItem(name: "showCompleted", value: "true"),
+                URLQueryItem(name: "showDeleted", value: "false"),
+                URLQueryItem(name: "showHidden", value: "true")
+            ]
+            if let pageToken {
+                components.queryItems?.append(URLQueryItem(name: "pageToken", value: pageToken))
+            }
+            var request = URLRequest(url: components.url!)
+            request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+            let response = try await googleResponse(GoogleTasksResponse.self, for: request)
+            googleTasks.append(contentsOf: response.items ?? [])
+            pageToken = response.nextPageToken
+        } while pageToken != nil
+
+        return mappedTasks(from: googleTasks, taskListID: taskListID, taskListTitle: taskListTitle)
+    }
+
+    private static func googleResponse<T: Decodable>(_ type: T.Type, for request: URLRequest) async throws -> T {
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw GoogleSyncError.invalidResponse
+        }
+        guard (200..<300).contains(httpResponse.statusCode) else {
+            throw GoogleSyncError.apiError(apiErrorMessage(from: data) ?? "Google Tasks request failed.")
+        }
+        return try JSONDecoder.googleDecoder.decode(T.self, from: data)
+    }
+
+    private static func mappedTasks(
+        from googleTasks: [GoogleTask],
+        taskListID: String,
+        taskListTitle: String?
+    ) -> [TaskItem] {
+        let childTasks = Dictionary(grouping: googleTasks.filter { $0.parent != nil }) { task in
+            task.parent ?? ""
+        }
+
+        return googleTasks
+            .filter { $0.parent == nil }
+            .map { task in
+                let subtasks = (childTasks[task.id] ?? []).map { child in
+                    SubtaskItem(
+                        id: googleID(listID: taskListID, taskID: child.id),
+                        title: cleanedTitle(child.title),
+                        done: child.status == "completed",
+                        createdAt: child.updated ?? Date(),
+                        updatedAt: child.updated
+                    )
+                }
+
+                return TaskItem(
+                    id: googleID(listID: taskListID, taskID: task.id),
+                    title: cleanedTitle(task.title),
+                    deadline: task.due,
+                    done: task.status == "completed",
+                    createdAt: task.updated ?? Date(),
+                    notes: task.notes,
+                    priority: .normal,
+                    updatedAt: task.updated,
+                    completedAt: task.completed,
+                    subtasks: subtasks.isEmpty ? nil : subtasks,
+                    recurrence: nil,
+                    pinned: nil,
+                    source: .google,
+                    externalID: task.id,
+                    externalListID: taskListID,
+                    externalUpdatedAt: task.updated,
+                    deadlineHasTime: false
+                )
+            }
+    }
+
+    private static func googleID(listID: String, taskID: String) -> String {
+        "google:\(listID):\(taskID)"
+    }
+
+    private static func cleanedTitle(_ title: String?) -> String {
+        let trimmed = (title ?? "Untitled Google task").trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "Untitled Google task" : trimmed
+    }
+
+    private static func apiErrorMessage(from data: Data) -> String? {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        if let error = object["error"] as? [String: Any] {
+            if let message = error["message"] as? String {
+                return message
+            }
+            if let status = error["status"] as? String {
+                return status
+            }
+        }
+        if let error = object["error"] as? String {
+            return error
+        }
+        return nil
+    }
+}
+
 enum TaskFilter: String, CaseIterable, Identifiable {
     case open
     case today
@@ -336,13 +893,21 @@ enum TaskFilter: String, CaseIterable, Identifiable {
     }
 }
 
+@MainActor
 final class TaskModel: ObservableObject {
     @Published private(set) var tasks: [TaskItem]
-    @Published private(set) var notificationSettings: NotificationSettings
+    @Published private(set) var settings: AppSettings
+    @Published private(set) var googleTaskLists: [GoogleTaskList] = []
+    @Published private(set) var isGoogleBusy = false
+    @Published var googleStatus: String?
+
+    var notificationSettings: NotificationSettings {
+        settings.notifications
+    }
 
     init() {
         tasks = TaskStore.load()
-        notificationSettings = SettingsStore.load()
+        settings = SettingsStore.load()
         NotificationScheduler.sync(tasks: tasks, settings: notificationSettings)
     }
 
@@ -369,7 +934,7 @@ final class TaskModel: ObservableObject {
 
     func reload() {
         tasks = TaskStore.load()
-        notificationSettings = SettingsStore.load()
+        settings = SettingsStore.load()
         NotificationScheduler.sync(tasks: tasks, settings: notificationSettings)
     }
 
@@ -396,7 +961,8 @@ final class TaskModel: ObservableObject {
             completedAt: nil,
             subtasks: nil,
             recurrence: deadline == nil ? nil : recurrence,
-            pinned: pinned ? true : nil
+            pinned: pinned ? true : nil,
+            deadlineHasTime: deadline == nil ? nil : true
         ), at: 0)
         persist()
     }
@@ -416,6 +982,7 @@ final class TaskModel: ObservableObject {
         let cleanNotes = notes.trimmingCharacters(in: .whitespacesAndNewlines)
         tasks = tasks.map { item in
             guard item.id == task.id else { return item }
+            guard !item.isGoogleTask else { return item }
             var updated = item
             updated.title = trimmed
             updated.notes = cleanNotes.isEmpty ? nil : cleanNotes
@@ -424,6 +991,7 @@ final class TaskModel: ObservableObject {
             updated.subtasks = subtasks.isEmpty ? nil : subtasks
             updated.recurrence = deadline == nil ? nil : recurrence
             updated.pinned = pinned ? true : nil
+            updated.deadlineHasTime = deadline == nil ? nil : true
             updated.updatedAt = Date()
             return updated
         }
@@ -431,6 +999,10 @@ final class TaskModel: ObservableObject {
     }
 
     func markDone(_ task: TaskItem) {
+        guard !task.isGoogleTask else {
+            googleStatus = "Google tasks are read-only. Complete this in Google Tasks."
+            return
+        }
         tasks = tasks.map { item in
             guard item.id == task.id else { return item }
             var updated = item
@@ -460,6 +1032,10 @@ final class TaskModel: ObservableObject {
     }
 
     func restore(_ task: TaskItem) {
+        guard !task.isGoogleTask else {
+            googleStatus = "Google tasks are read-only. Restore this in Google Tasks."
+            return
+        }
         tasks = tasks.map { item in
             guard item.id == task.id else { return item }
             var updated = item
@@ -472,11 +1048,19 @@ final class TaskModel: ObservableObject {
     }
 
     func delete(_ task: TaskItem) {
+        guard !task.isGoogleTask else {
+            googleStatus = "Google tasks are read-only. Remove this in Google Tasks."
+            return
+        }
         tasks.removeAll { $0.id == task.id }
         persist()
     }
 
     func togglePinned(_ task: TaskItem) {
+        guard !task.isGoogleTask else {
+            googleStatus = "Google tasks are read-only. Pin local tasks in Quiet Tasks."
+            return
+        }
         tasks = tasks.map { item in
             guard item.id == task.id else { return item }
             var updated = item
@@ -490,6 +1074,10 @@ final class TaskModel: ObservableObject {
     func toggleSubtask(taskID: String, subtaskID: String) {
         tasks = tasks.map { item in
             guard item.id == taskID else { return item }
+            guard !item.isGoogleTask else {
+                googleStatus = "Google subtasks are read-only. Update them in Google Tasks."
+                return item
+            }
             var updated = item
             updated.subtasks = item.taskSubtasks.map { subtask in
                 guard subtask.id == subtaskID else { return subtask }
@@ -507,20 +1095,94 @@ final class TaskModel: ObservableObject {
     func updateNotificationSettings(_ settings: NotificationSettings) {
         if settings.enabled {
             NotificationScheduler.requestAuthorization { [weak self] granted in
-                guard let self else { return }
-                let savedSettings = NotificationSettings(
-                    enabled: granted,
-                    reminderOffsets: settings.reminderOffsets.isEmpty ? [.oneHour] : settings.reminderOffsets
-                )
-                self.notificationSettings = savedSettings
-                SettingsStore.save(savedSettings)
-                NotificationScheduler.sync(tasks: self.tasks, settings: savedSettings)
+                Task { @MainActor in
+                    guard let self else { return }
+                    let savedSettings = NotificationSettings(
+                        enabled: granted,
+                        reminderOffsets: settings.reminderOffsets.isEmpty ? [.oneHour] : settings.reminderOffsets
+                    )
+                    self.settings.notifications = savedSettings
+                    SettingsStore.save(self.settings)
+                    NotificationScheduler.sync(tasks: self.tasks, settings: savedSettings)
+                }
             }
         } else {
-            notificationSettings = settings
-            SettingsStore.save(settings)
+            self.settings.notifications = settings
+            SettingsStore.save(self.settings)
             NotificationScheduler.sync(tasks: tasks, settings: settings)
         }
+    }
+
+    func updateAppearance(_ appearance: AppearanceMode) {
+        settings.appearance = appearance
+        SettingsStore.save(settings)
+    }
+
+    func updateGoogleSettings(_ googleSettings: GoogleSyncSettings) {
+        settings.googleSync = googleSettings
+        SettingsStore.save(settings)
+    }
+
+    func connectGoogle(clientID: String) async {
+        await runGoogleOperation {
+            var googleSettings = self.settings.googleSync
+            googleSettings.clientID = clientID.trimmingCharacters(in: .whitespacesAndNewlines)
+            self.settings.googleSync = googleSettings
+            SettingsStore.save(self.settings)
+
+            let token = try await GoogleOAuthClient.authorize(clientID: googleSettings.clientID)
+            googleSettings.isConnected = true
+            self.settings.googleSync = googleSettings
+            SettingsStore.save(self.settings)
+            try await self.loadGoogleTaskLists(accessToken: token.value)
+            self.googleStatus = "Google Tasks connected."
+        }
+    }
+
+    func loadGoogleTaskLists() async {
+        await runGoogleOperation {
+            let token = try await GoogleOAuthClient.refreshedAccessToken(clientID: self.settings.googleSync.clientID)
+            try await self.loadGoogleTaskLists(accessToken: token.value)
+            self.googleStatus = "Google task lists refreshed."
+        }
+    }
+
+    func syncGoogleTasks() async {
+        await runGoogleOperation {
+            let googleSettings = self.settings.googleSync
+            guard let taskListID = googleSettings.selectedTaskListID else {
+                throw GoogleSyncError.missingTaskList
+            }
+
+            let token = try await GoogleOAuthClient.refreshedAccessToken(clientID: googleSettings.clientID)
+            let syncedTasks = try await GoogleTasksClient.fetchTasks(
+                accessToken: token.value,
+                taskListID: taskListID,
+                taskListTitle: googleSettings.selectedTaskListTitle
+            )
+            self.tasks.removeAll { $0.source == .google }
+            self.tasks.append(contentsOf: syncedTasks)
+            self.settings.googleSync.lastSyncedAt = Date()
+            SettingsStore.save(self.settings)
+            self.persist()
+            self.googleStatus = "Synced \(syncedTasks.count) Google tasks."
+        }
+    }
+
+    func disconnectGoogle() {
+        KeychainTokenStore.deleteRefreshToken()
+        tasks.removeAll { $0.source == .google }
+        googleTaskLists = []
+        settings.googleSync = .default
+        SettingsStore.save(settings)
+        persist()
+        googleStatus = "Google Tasks disconnected."
+    }
+
+    func selectGoogleTaskList(_ list: GoogleTaskList) {
+        settings.googleSync.selectedTaskListID = list.id
+        settings.googleSync.selectedTaskListTitle = list.title
+        SettingsStore.save(settings)
     }
 
     func tasks(for filter: TaskFilter, search: String) -> [TaskItem] {
@@ -552,6 +1214,31 @@ final class TaskModel: ObservableObject {
         tasks = TaskStore.normalized(tasks)
         TaskStore.save(tasks)
         NotificationScheduler.sync(tasks: tasks, settings: notificationSettings)
+    }
+
+    private func loadGoogleTaskLists(accessToken: String) async throws {
+        let lists = try await GoogleTasksClient.fetchTaskLists(accessToken: accessToken)
+        googleTaskLists = lists
+
+        if settings.googleSync.selectedTaskListID == nil, let first = lists.first {
+            selectGoogleTaskList(first)
+        } else if let selectedID = settings.googleSync.selectedTaskListID,
+                  let selected = lists.first(where: { $0.id == selectedID }) {
+            settings.googleSync.selectedTaskListTitle = selected.title
+            SettingsStore.save(settings)
+        }
+    }
+
+    private func runGoogleOperation(_ operation: @escaping () async throws -> Void) async {
+        guard !isGoogleBusy else { return }
+        isGoogleBusy = true
+        googleStatus = nil
+        do {
+            try await operation()
+        } catch {
+            googleStatus = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        }
+        isGoogleBusy = false
     }
 }
 
@@ -592,8 +1279,9 @@ struct ContentView: View {
     @State private var newPinned = false
     @State private var pendingCompletion: TaskItem?
     @State private var pendingDeletion: TaskItem?
+    @State private var pendingReadOnlyGoogleTask: TaskItem?
     @State private var editingDraft: TaskDraft?
-    @State private var showingNotificationSettings = false
+    @State private var showingSettings = false
     @FocusState private var newTaskFocused: Bool
 
     var visibleTasks: [TaskItem] {
@@ -661,9 +1349,9 @@ struct ContentView: View {
                     Label("Refresh", systemImage: "arrow.clockwise")
                 }
                 Button {
-                    showingNotificationSettings = true
+                    showingSettings = true
                 } label: {
-                    Label("Notifications", systemImage: model.notificationSettings.enabled ? "bell.badge" : "bell")
+                    Label("Settings", systemImage: "gearshape")
                 }
             }
         }
@@ -703,6 +1391,16 @@ struct ContentView: View {
         } message: {
             Text(pendingDeletion?.title ?? "")
         }
+        .alert("Google task is read-only", isPresented: Binding(
+            get: { pendingReadOnlyGoogleTask != nil },
+            set: { if !$0 { pendingReadOnlyGoogleTask = nil } }
+        )) {
+            Button("OK") {
+                pendingReadOnlyGoogleTask = nil
+            }
+        } message: {
+            Text("Update “\(pendingReadOnlyGoogleTask?.title ?? "this task")” in Google Tasks. Quiet Tasks is only reading Google tasks in this version.")
+        }
         .sheet(item: $editingDraft) { draft in
             TaskEditSheet(draft: draft) { updatedDraft in
                 guard let task = updatedDraft.task else { return }
@@ -721,15 +1419,13 @@ struct ContentView: View {
                 editingDraft = nil
             }
         }
-        .sheet(isPresented: $showingNotificationSettings) {
-            NotificationSettingsSheet(settings: model.notificationSettings) { settings in
-                model.updateNotificationSettings(settings)
-                showingNotificationSettings = false
-            } onCancel: {
-                showingNotificationSettings = false
+        .sheet(isPresented: $showingSettings) {
+            SettingsSheet(model: model) {
+                showingSettings = false
             }
         }
         .frame(minWidth: 880, minHeight: 620)
+        .preferredColorScheme(model.settings.appearance.colorScheme)
     }
 
     private var header: some View {
@@ -789,7 +1485,7 @@ struct ContentView: View {
             ForEach(visibleTasks) { task in
                 TaskRow(
                     task: task,
-                    onComplete: { pendingCompletion = task },
+                    onComplete: { requestCompletion(for: task) },
                     onRestore: { model.restore(task) },
                     onEdit: { editingDraft = TaskDraft(task: task) },
                     onDelete: { pendingDeletion = task },
@@ -830,6 +1526,14 @@ struct ContentView: View {
         newTaskFocused = true
     }
 
+    private func requestCompletion(for task: TaskItem) {
+        if task.isGoogleTask {
+            pendingReadOnlyGoogleTask = task
+        } else {
+            pendingCompletion = task
+        }
+    }
+
     private func handleURL(_ url: URL) {
         guard url.scheme == "quiettasks" else { return }
 
@@ -843,7 +1547,16 @@ struct ContentView: View {
                 .first { $0.name == "id" }?
                 .value
             model.reload()
-            pendingCompletion = model.tasks.first { $0.id == id && !$0.done }
+            if let task = model.tasks.first(where: { $0.id == id && !$0.done }) {
+                requestCompletion(for: task)
+            }
+        case "google":
+            let id = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+                .queryItems?
+                .first { $0.name == "id" }?
+                .value
+            model.reload()
+            pendingReadOnlyGoogleTask = model.tasks.first { $0.id == id }
         case "subtask":
             let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
             let taskID = components?
@@ -880,7 +1593,7 @@ struct TaskRow: View {
                     .foregroundStyle(task.done ? .green : Color(red: 0.62, green: 0.86, blue: 0.88))
             }
             .buttonStyle(.plain)
-            .help(task.done ? "Restore" : "Complete")
+            .help(task.isGoogleTask ? "Open Google Tasks to update" : (task.done ? "Restore" : "Complete"))
 
             VStack(alignment: .leading, spacing: 6) {
                 HStack(spacing: 6) {
@@ -904,9 +1617,13 @@ struct TaskRow: View {
                 }
 
                 HStack(spacing: 10) {
-                    PriorityBadge(priority: task.taskPriority)
+                    if task.isGoogleTask {
+                        SourceBadge(title: "Google")
+                    } else {
+                        PriorityBadge(priority: task.taskPriority)
+                    }
                     if let deadline = task.deadline {
-                        Label(deadline.formatted(date: .abbreviated, time: .shortened), systemImage: "calendar")
+                        Label(deadlineText(deadline), systemImage: "calendar")
                     }
                     if let recurrence = task.recurrence {
                         Label(recurrence.title, systemImage: recurrence.symbol)
@@ -936,6 +1653,7 @@ struct TaskRow: View {
                                 .font(.callout)
                             }
                             .buttonStyle(.plain)
+                            .disabled(task.isGoogleTask)
                             .help(subtask.done ? "Restore subtask" : "Complete subtask")
                         }
                     }
@@ -950,22 +1668,32 @@ struct TaskRow: View {
                     Image(systemName: task.isPinned ? "pin.fill" : "pin")
                 }
                 .help(task.isPinned ? "Unpin" : "Pin")
+                .disabled(task.isGoogleTask)
 
                 Button(action: onEdit) {
                     Image(systemName: "pencil")
                 }
                 .help("Edit")
+                .disabled(task.isGoogleTask)
 
                 Button(role: .destructive, action: onDelete) {
                     Image(systemName: "trash")
                 }
                 .help("Delete")
+                .disabled(task.isGoogleTask)
             }
             .buttonStyle(.borderless)
             .font(.title3)
         }
         .padding(14)
         .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+
+    private func deadlineText(_ deadline: Date) -> String {
+        if task.showsDeadlineTime {
+            return deadline.formatted(date: .abbreviated, time: .shortened)
+        }
+        return deadline.formatted(date: .abbreviated, time: .omitted)
     }
 }
 
@@ -1222,27 +1950,69 @@ struct PinToggle: View {
     }
 }
 
-struct NotificationSettingsSheet: View {
-    @State private var draft: NotificationSettings
-    var onSave: (NotificationSettings) -> Void
-    var onCancel: () -> Void
+struct SettingsSheet: View {
+    @ObservedObject var model: TaskModel
+    @State private var draft: AppSettings
+    var onDone: () -> Void
 
-    init(
-        settings: NotificationSettings,
-        onSave: @escaping (NotificationSettings) -> Void,
-        onCancel: @escaping () -> Void
-    ) {
-        _draft = State(initialValue: settings)
-        self.onSave = onSave
-        self.onCancel = onCancel
+    init(model: TaskModel, onDone: @escaping () -> Void) {
+        self.model = model
+        _draft = State(initialValue: model.settings)
+        self.onDone = onDone
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            Text("Notifications")
+        VStack(alignment: .leading, spacing: 20) {
+            Text("Settings")
                 .font(.title.bold())
 
-            Toggle("Notifications", isOn: $draft.enabled)
+            appearanceSection
+            Divider()
+            notificationSection
+            Divider()
+            googleSection
+
+            if let status = model.googleStatus {
+                Text(status)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
+
+            HStack {
+                Spacer()
+                Button("Done") {
+                    saveSettings()
+                    onDone()
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(24)
+        .frame(width: 560)
+    }
+
+    private var appearanceSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label("Appearance", systemImage: "circle.lefthalf.filled")
+                .font(.headline)
+
+            Picker("Appearance", selection: $draft.appearance) {
+                ForEach(AppearanceMode.allCases) { mode in
+                    Text(mode.title).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .onChange(of: draft.appearance) { _, appearance in
+                model.updateAppearance(appearance)
+            }
+        }
+    }
+
+    private var notificationSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Toggle("Notifications", isOn: $draft.notifications.enabled)
                 .toggleStyle(.switch)
 
             VStack(alignment: .leading, spacing: 10) {
@@ -1252,40 +2022,136 @@ struct NotificationSettingsSheet: View {
                 ForEach(ReminderOffset.allCases) { offset in
                     Toggle(offset.title, isOn: reminderBinding(for: offset))
                         .toggleStyle(.checkbox)
-                        .disabled(!draft.enabled)
+                        .disabled(!draft.notifications.enabled)
+                }
+            }
+        }
+        .onChange(of: draft.notifications) { _, notifications in
+            model.updateNotificationSettings(notifications)
+        }
+    }
+
+    private var googleSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Label("Google Tasks", systemImage: "g.circle")
+                    .font(.headline)
+                Spacer()
+                if model.isGoogleBusy {
+                    ProgressView()
+                        .controlSize(.small)
                 }
             }
 
-            HStack {
-                Spacer()
-                Button("Cancel", action: onCancel)
-                    .keyboardShortcut(.cancelAction)
-                Button("Save") {
-                    if draft.enabled && draft.reminderOffsets.isEmpty {
-                        draft.reminderOffsets = [.oneHour]
+            Text("Read-only sync imports Google Tasks into the app and widget. Quiet Tasks will not edit Google Tasks yet.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+
+            TextField("OAuth client ID", text: $draft.googleSync.clientID)
+                .textFieldStyle(.roundedBorder)
+                .disabled(model.isGoogleBusy)
+
+            HStack(spacing: 10) {
+                if draft.googleSync.isConnected {
+                    Button {
+                        saveSettings()
+                        Task { await model.loadGoogleTaskLists() }
+                    } label: {
+                        Label("Refresh Lists", systemImage: "arrow.clockwise")
                     }
-                    draft.reminderOffsets.sort { $0.rawValue < $1.rawValue }
-                    onSave(draft)
+                    .disabled(model.isGoogleBusy)
+
+                    Button {
+                        saveSettings()
+                        Task { await model.syncGoogleTasks() }
+                    } label: {
+                        Label("Sync Now", systemImage: "arrow.triangle.2.circlepath")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(model.isGoogleBusy || draft.googleSync.selectedTaskListID == nil)
+
+                    Button(role: .destructive) {
+                        model.disconnectGoogle()
+                        draft.googleSync = model.settings.googleSync
+                    } label: {
+                        Label("Disconnect", systemImage: "xmark.circle")
+                    }
+                    .disabled(model.isGoogleBusy)
+                } else {
+                    Button {
+                        saveSettings()
+                        Task { await model.connectGoogle(clientID: draft.googleSync.clientID) }
+                    } label: {
+                        Label("Connect Google", systemImage: "person.crop.circle.badge.plus")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(model.isGoogleBusy || draft.googleSync.clientID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
-                .keyboardShortcut(.defaultAction)
+            }
+
+            if draft.googleSync.isConnected {
+                googleListPicker
+                if let lastSyncedAt = draft.googleSync.lastSyncedAt {
+                    Text("Last synced \(lastSyncedAt.formatted(date: .abbreviated, time: .shortened))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
         }
-        .padding(24)
-        .frame(width: 360)
+        .onChange(of: model.settings.googleSync) { _, googleSync in
+            draft.googleSync = googleSync
+        }
+    }
+
+    private var googleListPicker: some View {
+        HStack(spacing: 10) {
+            Label("Task list", systemImage: "list.bullet.rectangle")
+                .foregroundStyle(.secondary)
+            Picker("", selection: Binding(
+                get: { draft.googleSync.selectedTaskListID ?? "" },
+                set: { selectedID in
+                    guard let list = model.googleTaskLists.first(where: { $0.id == selectedID }) else { return }
+                    draft.googleSync.selectedTaskListID = list.id
+                    draft.googleSync.selectedTaskListTitle = list.title
+                    model.selectGoogleTaskList(list)
+                }
+            )) {
+                if model.googleTaskLists.isEmpty {
+                    Text(draft.googleSync.selectedTaskListTitle ?? "No lists loaded").tag(draft.googleSync.selectedTaskListID ?? "")
+                } else {
+                    ForEach(model.googleTaskLists) { list in
+                        Text(list.title).tag(list.id)
+                    }
+                }
+            }
+            .labelsHidden()
+            .frame(maxWidth: .infinity)
+            .disabled(model.googleTaskLists.isEmpty || model.isGoogleBusy)
+        }
+    }
+
+    private func saveSettings() {
+        draft.notifications.reminderOffsets.sort { $0.rawValue < $1.rawValue }
+        if draft.notifications.enabled && draft.notifications.reminderOffsets.isEmpty {
+            draft.notifications.reminderOffsets = [.oneHour]
+        }
+        model.updateAppearance(draft.appearance)
+        model.updateNotificationSettings(draft.notifications)
+        model.updateGoogleSettings(draft.googleSync)
     }
 
     private func reminderBinding(for offset: ReminderOffset) -> Binding<Bool> {
         Binding(
             get: {
-                draft.reminderOffsets.contains(offset)
+                draft.notifications.reminderOffsets.contains(offset)
             },
             set: { enabled in
                 if enabled {
-                    if !draft.reminderOffsets.contains(offset) {
-                        draft.reminderOffsets.append(offset)
+                    if !draft.notifications.reminderOffsets.contains(offset) {
+                        draft.notifications.reminderOffsets.append(offset)
                     }
                 } else {
-                    draft.reminderOffsets.removeAll { $0 == offset }
+                    draft.notifications.reminderOffsets.removeAll { $0 == offset }
                 }
             }
         )
@@ -1299,6 +2165,16 @@ struct PriorityBadge: View {
         Label(priority.title, systemImage: priority.symbol)
             .font(.caption.bold())
             .foregroundStyle(priority == .high ? Color(red: 0.95, green: 0.54, blue: 0.42) : .secondary)
+    }
+}
+
+struct SourceBadge: View {
+    var title: String
+
+    var body: some View {
+        Label(title, systemImage: "link")
+            .font(.caption.bold())
+            .foregroundStyle(Color(red: 0.62, green: 0.86, blue: 0.88))
     }
 }
 
