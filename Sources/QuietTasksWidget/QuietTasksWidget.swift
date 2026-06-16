@@ -1,3 +1,4 @@
+import AppIntents
 import SwiftUI
 import WidgetKit
 
@@ -108,6 +109,21 @@ enum TaskRecurrence: String, CaseIterable, Codable, Identifiable {
         case .monthly: "Monthly"
         }
     }
+
+    func nextDate(after deadline: Date, now: Date = Date()) -> Date {
+        let calendar = Calendar.current
+        let component: Calendar.Component = switch self {
+        case .daily: .day
+        case .weekly: .weekOfYear
+        case .monthly: .month
+        }
+
+        var next = calendar.date(byAdding: component, value: 1, to: deadline) ?? now
+        while next <= now {
+            next = calendar.date(byAdding: component, value: 1, to: next) ?? now
+        }
+        return next
+    }
 }
 
 enum AppearanceMode: String, CaseIterable, Codable, Identifiable {
@@ -142,7 +158,7 @@ enum TaskStore {
         sharedDirectory.appendingPathComponent("tasks.json")
     }
 
-    private static var sharedDirectory: URL {
+    static var sharedDirectory: URL {
         let directory = URL(fileURLWithPath: "/Users/Shared/QuietTasks", isDirectory: true)
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         return directory
@@ -151,6 +167,87 @@ enum TaskStore {
     static func load() -> [TaskItem] {
         guard let data = try? Data(contentsOf: fileURL) else { return [] }
         return (try? JSONDecoder.taskDecoder.decode([TaskItem].self, from: data)) ?? []
+    }
+
+    static func save(_ tasks: [TaskItem]) {
+        guard let data = try? JSONEncoder.taskEncoder.encode(normalized(tasks)) else { return }
+        try? FileManager.default.createDirectory(at: sharedDirectory, withIntermediateDirectories: true)
+        try? data.write(to: fileURL, options: .atomic)
+    }
+
+    static func complete(taskID: String) {
+        let now = Date()
+        let updatedTasks = load().map { item in
+            guard item.id == taskID, !item.done, !item.isGoogleTask else { return item }
+            var updated = item
+
+            if let recurrence = item.recurrence, let deadline = item.deadline {
+                updated.deadline = recurrence.nextDate(after: deadline, now: now)
+                updated.subtasks = item.taskSubtasks.map { subtask in
+                    var reset = subtask
+                    reset.done = false
+                    reset.updatedAt = now
+                    return reset
+                }
+                updated.updatedAt = now
+                return updated
+            }
+
+            updated.done = true
+            updated.completedAt = now
+            updated.updatedAt = now
+            updated.subtasks = item.taskSubtasks.map { subtask in
+                var completed = subtask
+                completed.done = true
+                completed.updatedAt = now
+                return completed
+            }
+            return updated
+        }
+        save(updatedTasks)
+    }
+
+    static func normalized(_ tasks: [TaskItem]) -> [TaskItem] {
+        tasks.sorted { lhs, rhs in
+            if lhs.done != rhs.done { return !lhs.done }
+            if lhs.isPinned != rhs.isPinned { return lhs.isPinned }
+            if lhs.taskPriority.rank != rhs.taskPriority.rank { return lhs.taskPriority.rank < rhs.taskPriority.rank }
+            switch (lhs.deadline, rhs.deadline) {
+            case let (left?, right?) where left != right:
+                return left < right
+            case (.some, .none):
+                return true
+            case (.none, .some):
+                return false
+            default:
+                return lhs.createdAt > rhs.createdAt
+            }
+        }
+    }
+}
+
+struct WidgetState: Codable, Equatable {
+    var pendingCompletionTaskID: String?
+}
+
+enum WidgetStateStore {
+    static var fileURL: URL {
+        TaskStore.sharedDirectory.appendingPathComponent("widget-state.json")
+    }
+
+    static func load() -> WidgetState {
+        guard let data = try? Data(contentsOf: fileURL),
+              let state = try? JSONDecoder.taskDecoder.decode(WidgetState.self, from: data)
+        else {
+            return WidgetState(pendingCompletionTaskID: nil)
+        }
+        return state
+    }
+
+    static func setPendingCompletionTaskID(_ taskID: String?) {
+        guard let data = try? JSONEncoder.taskEncoder.encode(WidgetState(pendingCompletionTaskID: taskID)) else { return }
+        try? FileManager.default.createDirectory(at: TaskStore.sharedDirectory, withIntermediateDirectories: true)
+        try? data.write(to: fileURL, options: .atomic)
     }
 }
 
@@ -178,10 +275,91 @@ extension JSONDecoder {
     }
 }
 
+extension JSONEncoder {
+    static var taskEncoder: JSONEncoder {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        return encoder
+    }
+}
+
+struct RequestTaskCompletionIntent: AppIntent {
+    static var title: LocalizedStringResource = "Confirm Task Completion"
+    static var description = IntentDescription("Shows an inline confirmation prompt in the Quiet Tasks widget.")
+
+    @Parameter(title: "Task ID")
+    var taskID: String
+
+    init() {
+        taskID = ""
+    }
+
+    init(taskID: String) {
+        self.taskID = taskID
+    }
+
+    func perform() async throws -> some IntentResult {
+        WidgetStateStore.setPendingCompletionTaskID(taskID)
+        WidgetCenter.shared.reloadAllTimelines()
+        return .result()
+    }
+}
+
+struct CancelTaskCompletionIntent: AppIntent {
+    static var title: LocalizedStringResource = "Cancel Task Completion"
+    static var description = IntentDescription("Dismisses the inline completion confirmation prompt.")
+
+    @Parameter(title: "Task ID")
+    var taskID: String
+
+    init() {
+        taskID = ""
+    }
+
+    init(taskID: String) {
+        self.taskID = taskID
+    }
+
+    func perform() async throws -> some IntentResult {
+        if WidgetStateStore.load().pendingCompletionTaskID == taskID {
+            WidgetStateStore.setPendingCompletionTaskID(nil)
+        }
+        WidgetCenter.shared.reloadAllTimelines()
+        return .result()
+    }
+}
+
+struct CompleteTaskFromWidgetIntent: AppIntent {
+    static var title: LocalizedStringResource = "Complete Task"
+    static var description = IntentDescription("Completes a Quiet Tasks task from the desktop widget.")
+
+    @Parameter(title: "Task ID")
+    var taskID: String
+
+    init() {
+        taskID = ""
+    }
+
+    init(taskID: String) {
+        self.taskID = taskID
+    }
+
+    func perform() async throws -> some IntentResult {
+        TaskStore.complete(taskID: taskID)
+        if WidgetStateStore.load().pendingCompletionTaskID == taskID {
+            WidgetStateStore.setPendingCompletionTaskID(nil)
+        }
+        WidgetCenter.shared.reloadAllTimelines()
+        return .result()
+    }
+}
+
 struct QuietEntry: TimelineEntry {
     let date: Date
     let tasks: [TaskItem]
     let appearance: AppearanceMode
+    let pendingCompletionTaskID: String?
 }
 
 struct Provider: TimelineProvider {
@@ -189,18 +367,24 @@ struct Provider: TimelineProvider {
         QuietEntry(date: Date(), tasks: [
             TaskItem(id: "1", title: "Plan sprint review", deadline: Date(), done: false, createdAt: Date(), notes: nil, priority: .high, updatedAt: nil, completedAt: nil),
             TaskItem(id: "2", title: "Send design notes", deadline: nil, done: false, createdAt: Date(), notes: nil, priority: .normal, updatedAt: nil, completedAt: nil)
-        ], appearance: WidgetSettingsStore.loadAppearance())
+        ], appearance: WidgetSettingsStore.loadAppearance(), pendingCompletionTaskID: nil)
     }
 
     func getSnapshot(in context: Context, completion: @escaping (QuietEntry) -> Void) {
-        completion(QuietEntry(date: Date(), tasks: TaskStore.load(), appearance: WidgetSettingsStore.loadAppearance()))
+        completion(QuietEntry(
+            date: Date(),
+            tasks: TaskStore.load(),
+            appearance: WidgetSettingsStore.loadAppearance(),
+            pendingCompletionTaskID: WidgetStateStore.load().pendingCompletionTaskID
+        ))
     }
 
     func getTimeline(in context: Context, completion: @escaping (Timeline<QuietEntry>) -> Void) {
         let entry = QuietEntry(
             date: Date(),
             tasks: TaskStore.load(),
-            appearance: WidgetSettingsStore.loadAppearance()
+            appearance: WidgetSettingsStore.loadAppearance(),
+            pendingCompletionTaskID: WidgetStateStore.load().pendingCompletionTaskID
         )
         completion(Timeline(entries: [entry], policy: .after(Date().addingTimeInterval(30))))
     }
@@ -372,11 +556,7 @@ struct QuietTasksWidgetView: View {
 
     private func taskRow(_ task: TaskItem, compact: Bool) -> some View {
         HStack(alignment: .top, spacing: compact ? 6 : 8) {
-            Link(destination: task.isGoogleTask ? googleURL(for: task) : completeURL(for: task)) {
-                Image(systemName: "circle")
-                    .font(compact ? .caption.bold() : .callout.bold())
-                    .foregroundStyle(palette.accent)
-            }
+            completionControl(for: task, compact: compact)
 
             VStack(alignment: .leading, spacing: compact ? 3 : 4) {
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
@@ -419,6 +599,10 @@ struct QuietTasksWidgetView: View {
                         .foregroundStyle(palette.mutedText)
                 }
 
+                if entry.pendingCompletionTaskID == task.id, !task.isGoogleTask {
+                    completionPrompt(for: task, compact: compact)
+                }
+
                 if !compact && !task.taskSubtasks.isEmpty {
                     VStack(alignment: .leading, spacing: 3) {
                         ForEach(Array(task.taskSubtasks.prefix(2))) { subtask in
@@ -441,6 +625,49 @@ struct QuietTasksWidgetView: View {
         .padding(compact ? 6 : 8)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(palette.surface, in: RoundedRectangle(cornerRadius: compact ? 8 : 10, style: .continuous))
+    }
+
+    @ViewBuilder
+    private func completionControl(for task: TaskItem, compact: Bool) -> some View {
+        if task.isGoogleTask {
+            Image(systemName: "circle")
+                .font(compact ? .caption.bold() : .callout.bold())
+                .foregroundStyle(palette.mutedText)
+        } else {
+            Button(intent: RequestTaskCompletionIntent(taskID: task.id)) {
+                Image(systemName: entry.pendingCompletionTaskID == task.id ? "checkmark.circle" : "circle")
+                    .font(compact ? .caption.bold() : .callout.bold())
+                    .foregroundStyle(palette.accent)
+            }
+            .buttonStyle(.plain)
+        }
+    }
+
+    private func completionPrompt(for task: TaskItem, compact: Bool) -> some View {
+        HStack(spacing: compact ? 5 : 7) {
+            Text("Complete?")
+                .font(compact ? .system(size: 8, weight: .bold) : .caption.bold())
+                .foregroundStyle(palette.primaryText)
+
+            Button(intent: CancelTaskCompletionIntent(taskID: task.id)) {
+                Text("Cancel")
+                    .font(compact ? .system(size: 8, weight: .bold) : .caption.bold())
+                    .foregroundStyle(palette.mutedText)
+            }
+            .buttonStyle(.plain)
+
+            Button(intent: CompleteTaskFromWidgetIntent(taskID: task.id)) {
+                Text("Done")
+                    .font(compact ? .system(size: 8, weight: .bold) : .caption.bold())
+                    .foregroundStyle(palette.background)
+                    .padding(.horizontal, compact ? 6 : 8)
+                    .padding(.vertical, compact ? 2 : 3)
+                    .background(palette.accent, in: Capsule())
+            }
+            .buttonStyle(.plain)
+        }
+        .lineLimit(1)
+        .padding(.top, compact ? 1 : 2)
     }
 
     private func completeURL(for task: TaskItem) -> URL {
