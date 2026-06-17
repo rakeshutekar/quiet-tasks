@@ -27,3 +27,13 @@ XcodeDerivedData/
 # Local notes
 .env
 .env.*
+
+# Marketing/generated assets
+marketing/captures/
+marketing/app-store/
+marketing/video/
+marketing/remotion/node_modules/
+marketing/remotion/out/
+marketing/.backup-*/
+marketing/.active-backup-dir
+marketing/.finder-create-desktop-backup

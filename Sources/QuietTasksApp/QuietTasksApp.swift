@@ -1,8 +1,7 @@
 import AppKit
-import AuthenticationServices
 import CryptoKit
+import Darwin
 import Foundation
-import Security
 import SwiftUI
 import UserNotifications
 import WidgetKit
@@ -193,6 +192,8 @@ enum AppearanceMode: String, CaseIterable, Codable, Identifiable {
 }
 
 struct GoogleSyncSettings: Codable, Equatable {
+    static let defaultClientID = "820308341063-g3mm94f5jmt5vnepdd0qk329650k8612.apps.googleusercontent.com"
+
     var clientID: String
     var isConnected: Bool
     var selectedTaskListID: String?
@@ -200,12 +201,20 @@ struct GoogleSyncSettings: Codable, Equatable {
     var lastSyncedAt: Date?
 
     static let `default` = GoogleSyncSettings(
-        clientID: "",
+        clientID: defaultClientID,
         isConnected: false,
         selectedTaskListID: nil,
         selectedTaskListTitle: nil,
         lastSyncedAt: nil
     )
+
+    var effectiveClientID: String {
+        let trimmed = clientID.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty || trimmed == Self.defaultClientID {
+            return GoogleOAuthLocalConfig.clientID ?? Self.defaultClientID
+        }
+        return trimmed
+    }
 }
 
 struct AppSettings: Codable, Equatable {
@@ -225,6 +234,54 @@ enum SharedFiles {
         let directory = URL(fileURLWithPath: "/Users/Shared/QuietTasks", isDirectory: true)
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         return directory
+    }
+}
+
+private extension String {
+    var nilIfEmpty: String? {
+        isEmpty ? nil : self
+    }
+}
+
+enum GoogleOAuthLocalConfig {
+    private struct Root: Decodable {
+        var installed: Installed?
+    }
+
+    private struct Installed: Decodable {
+        var clientID: String
+        var clientSecret: String?
+
+        enum CodingKeys: String, CodingKey {
+            case clientID = "client_id"
+            case clientSecret = "client_secret"
+        }
+    }
+
+    static var fileURL: URL {
+        SharedFiles.directory.appendingPathComponent("google-oauth.json")
+    }
+
+    static var clientID: String? {
+        installed?.clientID.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+    }
+
+    static func clientSecret(for clientID: String) -> String? {
+        guard let installed,
+              installed.clientID == clientID
+        else {
+            return nil
+        }
+        return installed.clientSecret?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+    }
+
+    private static var installed: Installed? {
+        guard let data = try? Data(contentsOf: fileURL),
+              let root = try? JSONDecoder().decode(Root.self, from: data)
+        else {
+            return nil
+        }
+        return root.installed
     }
 }
 
@@ -329,6 +386,9 @@ enum SettingsStore {
             normalized.notifications.reminderOffsets = [.oneHour]
         }
         normalized.googleSync.clientID = normalized.googleSync.clientID.trimmingCharacters(in: .whitespacesAndNewlines)
+        if normalized.googleSync.clientID.isEmpty {
+            normalized.googleSync.clientID = GoogleSyncSettings.defaultClientID
+        }
         return normalized
     }
 }
@@ -457,7 +517,7 @@ enum GoogleSyncError: LocalizedError {
         case .invalidResponse:
             "Google returned an unexpected response."
         case .oauthCancelled:
-            "Google sign-in was cancelled."
+            "Google sign-in was cancelled or timed out."
         case let .apiError(message):
             message
         }
@@ -480,6 +540,10 @@ enum GoogleDateParser {
     static func parse(_ value: String) -> Date? {
         fractionalFormatter.date(from: value) ?? standardFormatter.date(from: value)
     }
+
+    static func string(from date: Date) -> String {
+        standardFormatter.string(from: date)
+    }
 }
 
 extension JSONDecoder {
@@ -501,96 +565,352 @@ extension JSONDecoder {
     }
 }
 
-enum KeychainTokenStore {
-    private static let service = "com.rakeshutekar.quiettasks.google"
-    private static let account = "refresh-token"
+enum GoogleTokenStore {
+    private struct TokenFile: Codable {
+        var refreshToken: String
+    }
+
+    private static var fileURL: URL {
+        SharedFiles.directory.appendingPathComponent("google-token.json")
+    }
 
     static func saveRefreshToken(_ token: String) throws {
-        let data = Data(token.utf8)
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account
-        ]
-        SecItemDelete(query as CFDictionary)
+        let tokenFile = TokenFile(refreshToken: token)
+        guard let data = try? JSONEncoder.taskEncoder.encode(tokenFile) else {
+            throw GoogleSyncError.apiError("Could not save Google token.")
+        }
 
-        var item = query
-        item[kSecValueData as String] = data
-        item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
-        let status = SecItemAdd(item as CFDictionary, nil)
-        guard status == errSecSuccess else {
+        do {
+            try FileManager.default.createDirectory(at: SharedFiles.directory, withIntermediateDirectories: true)
+            try data.write(to: fileURL, options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
+        } catch {
             throw GoogleSyncError.apiError("Could not save Google token.")
         }
     }
 
     static func loadRefreshToken() -> String? {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne
-        ]
-        var result: AnyObject?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-        guard status == errSecSuccess,
-              let data = result as? Data,
-              let token = String(data: data, encoding: .utf8)
+        guard let data = try? Data(contentsOf: fileURL),
+              let tokenFile = try? JSONDecoder.taskDecoder.decode(TokenFile.self, from: data)
         else {
             return nil
         }
-        return token
+        return tokenFile.refreshToken.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
     }
 
     static func deleteRefreshToken() {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account
-        ]
-        SecItemDelete(query as CFDictionary)
+        try? FileManager.default.removeItem(at: fileURL)
     }
 }
 
-final class OAuthPresentationContextProvider: NSObject, ASWebAuthenticationPresentationContextProviding {
-    func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
-        NSApplication.shared.keyWindow
-            ?? NSApplication.shared.windows.first
-            ?? ASPresentationAnchor()
+final class OAuthLoopbackReceiver: @unchecked Sendable {
+    private let path: String
+    private var port: UInt16 = 0
+    private var socketFileDescriptor: Int32
+    private let queue = DispatchQueue(label: "QuietTasks.OAuthLoopbackReceiver")
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<URL, Error>?
+    private var finished = false
+
+    var redirectURI: String {
+        "http://127.0.0.1:\(port)\(path)"
+    }
+
+    init(path: String) throws {
+        self.path = path
+
+        let descriptor = Darwin.socket(AF_INET, SOCK_STREAM, 0)
+        guard descriptor >= 0 else {
+            throw Self.socketError("Could not start the local Google sign-in server")
+        }
+        socketFileDescriptor = descriptor
+
+        var reuseAddress: Int32 = 1
+        _ = Darwin.setsockopt(
+            socketFileDescriptor,
+            SOL_SOCKET,
+            SO_REUSEADDR,
+            &reuseAddress,
+            socklen_t(MemoryLayout<Int32>.size)
+        )
+
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = in_port_t(0).bigEndian
+        address.sin_addr = in_addr(s_addr: Darwin.inet_addr("127.0.0.1"))
+
+        var bindAddress = address
+        let bindResult = withUnsafePointer(to: &bindAddress) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { socketAddress in
+                Darwin.bind(socketFileDescriptor, socketAddress, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard bindResult == 0 else {
+            let error = Self.socketError("Could not bind the local Google sign-in server")
+            closeSocket()
+            throw error
+        }
+
+        guard Darwin.listen(socketFileDescriptor, 1) == 0 else {
+            let error = Self.socketError("Could not listen for the Google sign-in callback")
+            closeSocket()
+            throw error
+        }
+
+        var assignedAddress = sockaddr_in()
+        var assignedAddressLength = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let nameResult = withUnsafeMutablePointer(to: &assignedAddress) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { socketAddress in
+                Darwin.getsockname(socketFileDescriptor, socketAddress, &assignedAddressLength)
+            }
+        }
+        guard nameResult == 0 else {
+            let error = Self.socketError("Could not read the local Google sign-in port")
+            closeSocket()
+            throw error
+        }
+
+        port = UInt16(bigEndian: assignedAddress.sin_port)
+    }
+
+    deinit {
+        closeSocket()
+    }
+
+    func waitForCallback(timeout: TimeInterval) async throws -> URL {
+        try await withCheckedThrowingContinuation { continuation in
+            lock.lock()
+            if finished {
+                lock.unlock()
+                continuation.resume(throwing: GoogleSyncError.oauthCancelled)
+                return
+            }
+            self.continuation = continuation
+            lock.unlock()
+
+            queue.async { [weak self] in
+                self?.acceptCallback()
+            }
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout) { [weak self] in
+                self?.complete(.failure(GoogleSyncError.oauthCancelled))
+            }
+        }
+    }
+
+    func cancel() {
+        complete(.failure(GoogleSyncError.oauthCancelled))
+    }
+
+    private func acceptCallback() {
+        while !hasFinished() {
+            let descriptor = currentSocketFileDescriptor()
+            guard descriptor >= 0 else { return }
+
+            var clientAddress = sockaddr()
+            var clientAddressLength = socklen_t(MemoryLayout<sockaddr>.size)
+            let clientDescriptor = Darwin.accept(descriptor, &clientAddress, &clientAddressLength)
+            guard clientDescriptor >= 0 else {
+                if !hasFinished() {
+                    complete(.failure(GoogleSyncError.oauthCancelled))
+                }
+                return
+            }
+            defer { Darwin.close(clientDescriptor) }
+
+            guard let callbackURL = callbackURL(from: clientDescriptor) else {
+                sendResponse(
+                    status: "404 Not Found",
+                    body: "Quiet Tasks did not recognize this Google sign-in request.",
+                    to: clientDescriptor
+                )
+                continue
+            }
+
+            sendResponse(
+                status: "200 OK",
+                body: """
+                <!doctype html>
+                <html>
+                <head>
+                  <meta charset="utf-8">
+                  <title>Quiet Tasks Connected</title>
+                  <style>
+                    body { font: 15px -apple-system, BlinkMacSystemFont, sans-serif; margin: 48px; color: #202525; }
+                    h1 { font-size: 24px; margin-bottom: 8px; }
+                    p { color: #5b6363; }
+                  </style>
+                </head>
+                <body>
+                  <h1>Quiet Tasks connected</h1>
+                  <p>You can close this tab and return to Quiet Tasks.</p>
+                </body>
+                </html>
+                """,
+                to: clientDescriptor
+            )
+            complete(.success(callbackURL))
+            return
+        }
+    }
+
+    private func callbackURL(from clientDescriptor: Int32) -> URL? {
+        var buffer = [UInt8](repeating: 0, count: 8192)
+        let byteCount = buffer.withUnsafeMutableBytes { rawBuffer in
+            Darwin.recv(clientDescriptor, rawBuffer.baseAddress, rawBuffer.count, 0)
+        }
+        guard byteCount > 0,
+              let request = String(bytes: buffer.prefix(byteCount), encoding: .utf8)
+        else {
+            return nil
+        }
+
+        let requestLine = request
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false)
+            .first
+        guard let requestLine else { return nil }
+
+        let parts = requestLine.split(separator: " ")
+        guard parts.count >= 2 else { return nil }
+        let target = String(parts[1])
+        guard target.hasPrefix("/") else { return nil }
+        guard let url = URL(string: "http://127.0.0.1:\(port)\(target)"),
+              url.path == path
+        else {
+            return nil
+        }
+        return url
+    }
+
+    private func sendResponse(status: String, body: String, to clientDescriptor: Int32) {
+        let bodyData = Data(body.utf8)
+        let headers = [
+            "HTTP/1.1 \(status)",
+            "Content-Type: text/html; charset=utf-8",
+            "Content-Length: \(bodyData.count)",
+            "Connection: close",
+            "",
+            ""
+        ].joined(separator: "\r\n")
+        var response = Data(headers.utf8)
+        response.append(bodyData)
+
+        var bytesSent = 0
+        response.withUnsafeBytes { rawBuffer in
+            guard let baseAddress = rawBuffer.baseAddress else { return }
+            while bytesSent < response.count {
+                let sent = Darwin.send(
+                    clientDescriptor,
+                    baseAddress.advanced(by: bytesSent),
+                    response.count - bytesSent,
+                    0
+                )
+                guard sent > 0 else { return }
+                bytesSent += sent
+            }
+        }
+    }
+
+    private func complete(_ result: Result<URL, Error>) {
+        let continuationToResume: CheckedContinuation<URL, Error>?
+
+        lock.lock()
+        guard !finished else {
+            lock.unlock()
+            return
+        }
+        finished = true
+        continuationToResume = continuation
+        continuation = nil
+        closeSocketLocked()
+        lock.unlock()
+
+        guard let continuationToResume else { return }
+        switch result {
+        case .success(let url):
+            continuationToResume.resume(returning: url)
+        case .failure(let error):
+            continuationToResume.resume(throwing: error)
+        }
+    }
+
+    private func hasFinished() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return finished
+    }
+
+    private func currentSocketFileDescriptor() -> Int32 {
+        lock.lock()
+        defer { lock.unlock() }
+        return socketFileDescriptor
+    }
+
+    private func closeSocket() {
+        lock.lock()
+        closeSocketLocked()
+        lock.unlock()
+    }
+
+    private func closeSocketLocked() {
+        guard socketFileDescriptor >= 0 else { return }
+        _ = Darwin.shutdown(socketFileDescriptor, SHUT_RDWR)
+        Darwin.close(socketFileDescriptor)
+        socketFileDescriptor = -1
+    }
+
+    private static func socketError(_ message: String) -> GoogleSyncError {
+        GoogleSyncError.apiError("\(message): \(String(cString: Darwin.strerror(errno))).")
     }
 }
 
 enum GoogleOAuthClient {
-    static let scope = "https://www.googleapis.com/auth/tasks.readonly"
-    private static let redirectURI = "com.rakeshutekar.quiettasks:/oauth2redirect"
-    private static let callbackScheme = "com.rakeshutekar.quiettasks"
-    private static var currentSession: ASWebAuthenticationSession?
-    private static let presentationProvider = OAuthPresentationContextProvider()
+    static let scope = "https://www.googleapis.com/auth/tasks"
+    private static let callbackPath = "/"
 
     static func authorize(clientID: String) async throws -> GoogleAccessToken {
         let trimmedClientID = clientID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedClientID.isEmpty else { throw GoogleSyncError.missingClientID }
 
+        let receiver = try OAuthLoopbackReceiver(path: callbackPath)
+        defer { receiver.cancel() }
+
         let verifier = pkceVerifier()
         let challenge = pkceChallenge(for: verifier)
+        let state = pkceVerifier()
         var components = URLComponents(string: "https://accounts.google.com/o/oauth2/v2/auth")!
         components.queryItems = [
             URLQueryItem(name: "client_id", value: trimmedClientID),
-            URLQueryItem(name: "redirect_uri", value: redirectURI),
+            URLQueryItem(name: "redirect_uri", value: receiver.redirectURI),
             URLQueryItem(name: "response_type", value: "code"),
             URLQueryItem(name: "scope", value: scope),
             URLQueryItem(name: "access_type", value: "offline"),
             URLQueryItem(name: "prompt", value: "consent"),
             URLQueryItem(name: "code_challenge", value: challenge),
-            URLQueryItem(name: "code_challenge_method", value: "S256")
+            URLQueryItem(name: "code_challenge_method", value: "S256"),
+            URLQueryItem(name: "state", value: state)
         ]
 
         guard let authorizationURL = components.url else { throw GoogleSyncError.invalidResponse }
-        let callbackURL = try await authenticate(url: authorizationURL)
-        guard let code = URLComponents(url: callbackURL, resolvingAgainstBaseURL: false)?
-            .queryItems?
-            .first(where: { $0.name == "code" })?
-            .value
+        let callbackTask = Task {
+            try await receiver.waitForCallback(timeout: 180)
+        }
+        guard NSWorkspace.shared.open(authorizationURL) else {
+            receiver.cancel()
+            throw GoogleSyncError.apiError("Could not open Google sign-in in your browser.")
+        }
+
+        let callbackURL = try await callbackTask.value
+        let queryItems = URLComponents(url: callbackURL, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        if let error = queryItems.first(where: { $0.name == "error" })?.value {
+            let description = queryItems.first(where: { $0.name == "error_description" })?.value
+            throw GoogleSyncError.apiError(description ?? "Google sign-in failed: \(error)")
+        }
+        guard queryItems.first(where: { $0.name == "state" })?.value == state else {
+            throw GoogleSyncError.invalidResponse
+        }
+        guard let code = queryItems.first(where: { $0.name == "code" })?.value
         else {
             throw GoogleSyncError.invalidResponse
         }
@@ -598,10 +918,11 @@ enum GoogleOAuthClient {
         let response = try await exchangeCode(
             code,
             clientID: trimmedClientID,
-            verifier: verifier
+            verifier: verifier,
+            redirectURI: receiver.redirectURI
         )
         if let refreshToken = response.refreshToken {
-            try KeychainTokenStore.saveRefreshToken(refreshToken)
+            try GoogleTokenStore.saveRefreshToken(refreshToken)
         }
         return GoogleAccessToken(
             value: response.accessToken,
@@ -612,18 +933,22 @@ enum GoogleOAuthClient {
     static func refreshedAccessToken(clientID: String) async throws -> GoogleAccessToken {
         let trimmedClientID = clientID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedClientID.isEmpty else { throw GoogleSyncError.missingClientID }
-        guard let refreshToken = KeychainTokenStore.loadRefreshToken() else {
+        guard let refreshToken = GoogleTokenStore.loadRefreshToken() else {
             throw GoogleSyncError.missingRefreshToken
         }
 
         var request = URLRequest(url: URL(string: "https://oauth2.googleapis.com/token")!)
         request.httpMethod = "POST"
         request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-        request.httpBody = formEncoded([
+        var body = [
             "client_id": trimmedClientID,
             "refresh_token": refreshToken,
             "grant_type": "refresh_token"
-        ])
+        ]
+        if let clientSecret = GoogleOAuthLocalConfig.clientSecret(for: trimmedClientID) {
+            body["client_secret"] = clientSecret
+        }
+        request.httpBody = formEncoded(body)
 
         let response = try await tokenResponse(for: request)
         return GoogleAccessToken(
@@ -632,48 +957,26 @@ enum GoogleOAuthClient {
         )
     }
 
-    private static func authenticate(url: URL) async throws -> URL {
-        try await withCheckedThrowingContinuation { continuation in
-            let session = ASWebAuthenticationSession(
-                url: url,
-                callbackURLScheme: callbackScheme
-            ) { callbackURL, error in
-                currentSession = nil
-                if let callbackURL {
-                    continuation.resume(returning: callbackURL)
-                    return
-                }
-
-                if let error = error as? ASWebAuthenticationSessionError,
-                   error.code == .canceledLogin {
-                    continuation.resume(throwing: GoogleSyncError.oauthCancelled)
-                    return
-                }
-
-                continuation.resume(throwing: error ?? GoogleSyncError.invalidResponse)
-            }
-            session.presentationContextProvider = presentationProvider
-            session.prefersEphemeralWebBrowserSession = false
-            currentSession = session
-            session.start()
-        }
-    }
-
     private static func exchangeCode(
         _ code: String,
         clientID: String,
-        verifier: String
+        verifier: String,
+        redirectURI: String
     ) async throws -> GoogleTokenResponse {
         var request = URLRequest(url: URL(string: "https://oauth2.googleapis.com/token")!)
         request.httpMethod = "POST"
         request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-        request.httpBody = formEncoded([
+        var body = [
             "client_id": clientID,
             "code": code,
             "code_verifier": verifier,
             "grant_type": "authorization_code",
             "redirect_uri": redirectURI
-        ])
+        ]
+        if let clientSecret = GoogleOAuthLocalConfig.clientSecret(for: clientID) {
+            body["client_secret"] = clientSecret
+        }
+        request.httpBody = formEncoded(body)
         return try await tokenResponse(for: request)
     }
 
@@ -783,6 +1086,24 @@ enum GoogleTasksClient {
         return mappedTasks(from: googleTasks, taskListID: taskListID, taskListTitle: taskListTitle)
     }
 
+    static func setCompletion(
+        accessToken: String,
+        taskListID: String,
+        taskID: String,
+        done: Bool,
+        completedAt: Date
+    ) async throws -> GoogleTask {
+        let encodedListID = taskListID.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? taskListID
+        let encodedTaskID = taskID.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? taskID
+        let url = URL(string: "https://tasks.googleapis.com/tasks/v1/lists/\(encodedListID)/tasks/\(encodedTaskID)")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "PATCH"
+        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: googleCompletionBody(done: done, completedAt: completedAt))
+        return try await googleResponse(GoogleTask.self, for: request)
+    }
+
     private static func googleResponse<T: Decodable>(_ type: T.Type, for request: URLRequest) async throws -> T {
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let httpResponse = response as? HTTPURLResponse else {
@@ -792,6 +1113,19 @@ enum GoogleTasksClient {
             throw GoogleSyncError.apiError(apiErrorMessage(from: data) ?? "Google Tasks request failed.")
         }
         return try JSONDecoder.googleDecoder.decode(T.self, from: data)
+    }
+
+    private static func googleCompletionBody(done: Bool, completedAt: Date) -> [String: Any] {
+        if done {
+            return [
+                "status": "completed",
+                "completed": GoogleDateParser.string(from: completedAt)
+            ]
+        }
+        return [
+            "status": "needsAction",
+            "completed": NSNull()
+        ]
     }
 
     private static func mappedTasks(
@@ -900,6 +1234,8 @@ final class TaskModel: ObservableObject {
     @Published private(set) var googleTaskLists: [GoogleTaskList] = []
     @Published private(set) var isGoogleBusy = false
     @Published var googleStatus: String?
+    private var autoSyncTask: Task<Void, Never>?
+    private static let googleAutoSyncIntervalNanoseconds: UInt64 = 60 * 1_000_000_000
 
     var notificationSettings: NotificationSettings {
         settings.notifications
@@ -910,6 +1246,11 @@ final class TaskModel: ObservableObject {
         settings = SettingsStore.load()
         NotificationScheduler.sync(tasks: tasks, settings: notificationSettings)
         WidgetCenter.shared.reloadAllTimelines()
+        startAutoSync()
+    }
+
+    deinit {
+        autoSyncTask?.cancel()
     }
 
     var openTasks: [TaskItem] {
@@ -938,6 +1279,15 @@ final class TaskModel: ObservableObject {
         settings = SettingsStore.load()
         NotificationScheduler.sync(tasks: tasks, settings: notificationSettings)
         WidgetCenter.shared.reloadAllTimelines()
+    }
+
+    func syncGoogleTasksIfPossible() async {
+        guard settings.googleSync.isConnected,
+              settings.googleSync.selectedTaskListID != nil
+        else {
+            return
+        }
+        await syncGoogleTasks()
     }
 
     func add(
@@ -1001,8 +1351,8 @@ final class TaskModel: ObservableObject {
     }
 
     func markDone(_ task: TaskItem) {
-        guard !task.isGoogleTask else {
-            googleStatus = "Google tasks are read-only. Complete this in Google Tasks."
+        if task.isGoogleTask {
+            Task { await setGoogleTaskCompletion(task, done: true) }
             return
         }
         tasks = tasks.map { item in
@@ -1034,8 +1384,8 @@ final class TaskModel: ObservableObject {
     }
 
     func restore(_ task: TaskItem) {
-        guard !task.isGoogleTask else {
-            googleStatus = "Google tasks are read-only. Restore this in Google Tasks."
+        if task.isGoogleTask {
+            Task { await setGoogleTaskCompletion(task, done: false) }
             return
         }
         tasks = tasks.map { item in
@@ -1051,7 +1401,7 @@ final class TaskModel: ObservableObject {
 
     func delete(_ task: TaskItem) {
         guard !task.isGoogleTask else {
-            googleStatus = "Google tasks are read-only. Remove this in Google Tasks."
+            googleStatus = "Google task delete is not enabled yet. Remove this in Google Tasks."
             return
         }
         tasks.removeAll { $0.id == task.id }
@@ -1077,7 +1427,7 @@ final class TaskModel: ObservableObject {
         tasks = tasks.map { item in
             guard item.id == taskID else { return item }
             guard !item.isGoogleTask else {
-                googleStatus = "Google subtasks are read-only. Update them in Google Tasks."
+                googleStatus = "Google subtask sync is not enabled yet. Update subtasks in Google Tasks."
                 return item
             }
             var updated = item
@@ -1130,21 +1480,29 @@ final class TaskModel: ObservableObject {
         await runGoogleOperation {
             var googleSettings = self.settings.googleSync
             googleSettings.clientID = clientID.trimmingCharacters(in: .whitespacesAndNewlines)
+            if googleSettings.clientID.isEmpty {
+                googleSettings.clientID = GoogleSyncSettings.defaultClientID
+            }
             self.settings.googleSync = googleSettings
             SettingsStore.save(self.settings)
 
-            let token = try await GoogleOAuthClient.authorize(clientID: googleSettings.clientID)
+            let token = try await GoogleOAuthClient.authorize(clientID: googleSettings.effectiveClientID)
             googleSettings.isConnected = true
             self.settings.googleSync = googleSettings
             SettingsStore.save(self.settings)
             try await self.loadGoogleTaskLists(accessToken: token.value)
-            self.googleStatus = "Google Tasks connected."
+            if self.settings.googleSync.selectedTaskListID != nil {
+                let syncedCount = try await self.syncGoogleTasks(accessToken: token.value)
+                self.googleStatus = "Google Tasks connected. Synced \(syncedCount) tasks."
+            } else {
+                self.googleStatus = "Google Tasks connected. Choose a task list to sync."
+            }
         }
     }
 
     func loadGoogleTaskLists() async {
         await runGoogleOperation {
-            let token = try await GoogleOAuthClient.refreshedAccessToken(clientID: self.settings.googleSync.clientID)
+            let token = try await GoogleOAuthClient.refreshedAccessToken(clientID: self.settings.googleSync.effectiveClientID)
             try await self.loadGoogleTaskLists(accessToken: token.value)
             self.googleStatus = "Google task lists refreshed."
         }
@@ -1153,27 +1511,92 @@ final class TaskModel: ObservableObject {
     func syncGoogleTasks() async {
         await runGoogleOperation {
             let googleSettings = self.settings.googleSync
-            guard let taskListID = googleSettings.selectedTaskListID else {
-                throw GoogleSyncError.missingTaskList
-            }
-
-            let token = try await GoogleOAuthClient.refreshedAccessToken(clientID: googleSettings.clientID)
-            let syncedTasks = try await GoogleTasksClient.fetchTasks(
-                accessToken: token.value,
-                taskListID: taskListID,
-                taskListTitle: googleSettings.selectedTaskListTitle
-            )
-            self.tasks.removeAll { $0.source == .google }
-            self.tasks.append(contentsOf: syncedTasks)
-            self.settings.googleSync.lastSyncedAt = Date()
-            SettingsStore.save(self.settings)
-            self.persist()
-            self.googleStatus = "Synced \(syncedTasks.count) Google tasks."
+            let token = try await GoogleOAuthClient.refreshedAccessToken(clientID: googleSettings.effectiveClientID)
+            let syncedCount = try await self.syncGoogleTasks(accessToken: token.value)
+            self.googleStatus = "Synced \(syncedCount) Google tasks."
         }
     }
 
+    private func setGoogleTaskCompletion(_ task: TaskItem, done: Bool) async {
+        guard let taskListID = task.externalListID,
+              let taskID = task.externalID
+        else {
+            googleStatus = GoogleSyncError.invalidResponse.errorDescription
+            return
+        }
+
+        let previousTask = tasks.first { $0.id == task.id } ?? task
+        let completedAt = Date()
+        applyGoogleCompletionLocally(
+            taskID: task.id,
+            done: done,
+            completedAt: done ? completedAt : nil,
+            updatedAt: completedAt
+        )
+
+        let wasGoogleBusy = isGoogleBusy
+        isGoogleBusy = true
+        googleStatus = done ? "Completing in Google Tasks..." : "Restoring in Google Tasks..."
+
+        do {
+            let token = try await GoogleOAuthClient.refreshedAccessToken(clientID: self.settings.googleSync.effectiveClientID)
+            let updatedGoogleTask = try await GoogleTasksClient.setCompletion(
+                accessToken: token.value,
+                taskListID: taskListID,
+                taskID: taskID,
+                done: done,
+                completedAt: completedAt
+            )
+
+            applyGoogleCompletionLocally(
+                taskID: task.id,
+                done: done,
+                completedAt: done ? (updatedGoogleTask.completed ?? completedAt) : nil,
+                updatedAt: updatedGoogleTask.updated ?? Date()
+            )
+            googleStatus = done ? "Completed in Google Tasks." : "Restored in Google Tasks."
+        } catch {
+            restoreLocalTask(previousTask)
+            googleStatus = googleWriteErrorMessage(error)
+        }
+
+        if !wasGoogleBusy {
+            isGoogleBusy = false
+        }
+    }
+
+    private func applyGoogleCompletionLocally(taskID: String, done: Bool, completedAt: Date?, updatedAt: Date) {
+        tasks = tasks.map { item in
+            guard item.id == taskID else { return item }
+            var updated = item
+            updated.done = done
+            updated.completedAt = completedAt
+            updated.updatedAt = updatedAt
+            return updated
+        }
+        persist()
+    }
+
+    private func restoreLocalTask(_ task: TaskItem) {
+        tasks = tasks.map { item in
+            item.id == task.id ? task : item
+        }
+        persist()
+    }
+
+    private func googleWriteErrorMessage(_ error: Error) -> String {
+        let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        let lowercasedMessage = message.lowercased()
+        if lowercasedMessage.contains("insufficient")
+            || lowercasedMessage.contains("permission")
+            || lowercasedMessage.contains("scope") {
+            return "Reconnect Google Tasks once to grant completion sync permission."
+        }
+        return message
+    }
+
     func disconnectGoogle() {
-        KeychainTokenStore.deleteRefreshToken()
+        GoogleTokenStore.deleteRefreshToken()
         tasks.removeAll { $0.source == .google }
         googleTaskLists = []
         settings.googleSync = .default
@@ -1219,6 +1642,19 @@ final class TaskModel: ObservableObject {
         NotificationScheduler.sync(tasks: tasks, settings: notificationSettings)
     }
 
+    private func startAutoSync() {
+        autoSyncTask?.cancel()
+        autoSyncTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.syncGoogleTasksIfPossible()
+
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: Self.googleAutoSyncIntervalNanoseconds)
+                await self.syncGoogleTasksIfPossible()
+            }
+        }
+    }
+
     private func loadGoogleTaskLists(accessToken: String) async throws {
         let lists = try await GoogleTasksClient.fetchTaskLists(accessToken: accessToken)
         googleTaskLists = lists
@@ -1230,6 +1666,26 @@ final class TaskModel: ObservableObject {
             settings.googleSync.selectedTaskListTitle = selected.title
             SettingsStore.save(settings)
         }
+    }
+
+    @discardableResult
+    private func syncGoogleTasks(accessToken: String) async throws -> Int {
+        let googleSettings = settings.googleSync
+        guard let taskListID = googleSettings.selectedTaskListID else {
+            throw GoogleSyncError.missingTaskList
+        }
+
+        let syncedTasks = try await GoogleTasksClient.fetchTasks(
+            accessToken: accessToken,
+            taskListID: taskListID,
+            taskListTitle: googleSettings.selectedTaskListTitle
+        )
+        tasks.removeAll { $0.source == .google }
+        tasks.append(contentsOf: syncedTasks)
+        settings.googleSync.lastSyncedAt = Date()
+        SettingsStore.save(settings)
+        persist()
+        return syncedTasks.count
     }
 
     private func runGoogleOperation(_ operation: @escaping () async throws -> Void) async {
@@ -1347,7 +1803,7 @@ struct ContentView: View {
                     Label("New Task", systemImage: "plus")
                 }
                 Button {
-                    model.reload()
+                    refreshTasks()
                 } label: {
                     Label("Refresh", systemImage: "arrow.clockwise")
                 }
@@ -1360,7 +1816,7 @@ struct ContentView: View {
         }
         .onOpenURL(perform: handleURL)
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
-            model.reload()
+            refreshTasks()
         }
         .alert("Complete task?", isPresented: Binding(
             get: { pendingCompletion != nil },
@@ -1394,7 +1850,7 @@ struct ContentView: View {
         } message: {
             Text(pendingDeletion?.title ?? "")
         }
-        .alert("Google task is read-only", isPresented: Binding(
+        .alert("Google task editing is limited", isPresented: Binding(
             get: { pendingReadOnlyGoogleTask != nil },
             set: { if !$0 { pendingReadOnlyGoogleTask = nil } }
         )) {
@@ -1402,7 +1858,7 @@ struct ContentView: View {
                 pendingReadOnlyGoogleTask = nil
             }
         } message: {
-            Text("Update “\(pendingReadOnlyGoogleTask?.title ?? "this task")” in Google Tasks. Quiet Tasks is only reading Google tasks in this version.")
+            Text("Complete or restore “\(pendingReadOnlyGoogleTask?.title ?? "this task")” here. Edit and delete Google tasks in Google Tasks.")
         }
         .sheet(item: $editingDraft) { draft in
             TaskEditSheet(draft: draft) { updatedDraft in
@@ -1449,6 +1905,13 @@ struct ContentView: View {
         if model.tasks.isEmpty { return "No tasks yet" }
         if model.openTasks.isEmpty { return "All clear" }
         return "\(model.openTasks.count) open, \(model.completedCount) done"
+    }
+
+    private func refreshTasks() {
+        model.reload()
+        Task {
+            await model.syncGoogleTasksIfPossible()
+        }
     }
 
     private var addComposer: some View {
@@ -1530,17 +1993,16 @@ struct ContentView: View {
     }
 
     private func requestCompletion(for task: TaskItem) {
-        if task.isGoogleTask {
-            pendingReadOnlyGoogleTask = task
-        } else {
-            pendingCompletion = task
-        }
+        pendingCompletion = task
     }
 
     private func handleURL(_ url: URL) {
         guard url.scheme == "quiettasks" else { return }
 
         switch url.host {
+        case "open":
+            selectedFilter = .open
+            model.reload()
         case "add":
             selectedFilter = .open
             newTaskFocused = true
@@ -1596,7 +2058,7 @@ struct TaskRow: View {
                     .foregroundStyle(task.done ? .green : Color(red: 0.62, green: 0.86, blue: 0.88))
             }
             .buttonStyle(.plain)
-            .help(task.isGoogleTask ? "Open Google Tasks to update" : (task.done ? "Restore" : "Complete"))
+            .help(task.done ? "Restore" : "Complete")
 
             VStack(alignment: .leading, spacing: 6) {
                 HStack(spacing: 6) {
@@ -1956,6 +2418,7 @@ struct PinToggle: View {
 struct SettingsSheet: View {
     @ObservedObject var model: TaskModel
     @State private var draft: AppSettings
+    @State private var showAdvancedGoogleSettings = false
     var onDone: () -> Void
 
     init(model: TaskModel, onDone: @escaping () -> Void) {
@@ -2046,13 +2509,23 @@ struct SettingsSheet: View {
                 }
             }
 
-            Text("Read-only sync imports Google Tasks into the app and widget. Quiet Tasks will not edit Google Tasks yet.")
+            Text("Sync imports Google Tasks into the app and widget. Completing or restoring a Google task here updates Google Tasks too.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
 
-            TextField("OAuth client ID", text: $draft.googleSync.clientID)
-                .textFieldStyle(.roundedBorder)
-                .disabled(model.isGoogleBusy)
+            DisclosureGroup("Advanced", isExpanded: $showAdvancedGoogleSettings) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Use this only if you are running a fork with your own Google Cloud Desktop OAuth client.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    TextField("Desktop OAuth client ID", text: $draft.googleSync.clientID)
+                        .textFieldStyle(.roundedBorder)
+                        .disabled(model.isGoogleBusy)
+                }
+                .padding(.top, 6)
+            }
+            .font(.caption)
 
             HStack(spacing: 10) {
                 if draft.googleSync.isConnected {
@@ -2088,7 +2561,7 @@ struct SettingsSheet: View {
                         Label("Connect Google", systemImage: "person.crop.circle.badge.plus")
                     }
                     .buttonStyle(.borderedProminent)
-                    .disabled(model.isGoogleBusy || draft.googleSync.clientID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .disabled(model.isGoogleBusy)
                 }
             }
 

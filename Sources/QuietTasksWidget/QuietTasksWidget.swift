@@ -491,22 +491,36 @@ struct QuietTasksWidgetView: View {
                     .frame(maxWidth: .infinity)
                 Spacer()
             } else {
-                VStack(alignment: .leading, spacing: compact ? 5 : 7) {
-                    ForEach(Array(openTasks.prefix(taskLimit))) { task in
-                        taskRow(task, compact: compact)
-                    }
-
-                    if openTasks.count > taskLimit {
-                        Text("+ \(openTasks.count - taskLimit) more")
-                            .font(.caption.bold())
-                            .foregroundStyle(palette.mutedText)
-                    }
-                }
+                taskListArea(visibleLimit: taskLimit, compact: compact)
                 Spacer(minLength: 0)
             }
         }
         .widgetAccentable(false)
         .containerBackground(palette.background, for: .widget)
+    }
+
+    private func taskListArea(visibleLimit: Int, compact: Bool) -> some View {
+        let hasOverflow = openTasks.count > visibleLimit
+
+        return VStack(alignment: .leading, spacing: compact ? 5 : 7) {
+            ForEach(Array(openTasks.prefix(visibleLimit))) { task in
+                taskRow(task, compact: compact)
+            }
+
+            if hasOverflow {
+                Link(destination: URL(string: "quiettasks://open")!) {
+                    HStack(spacing: 5) {
+                        Image(systemName: "arrow.up.forward")
+                            .font(.system(size: compact ? 8 : 9, weight: .bold))
+                        Text("Open \(openTasks.count - visibleLimit) more")
+                            .font(compact ? .system(size: 9, weight: .bold) : .caption.bold())
+                    }
+                    .foregroundStyle(palette.mutedText)
+                    .lineLimit(1)
+                }
+            }
+        }
+        .frame(maxHeight: .infinity, alignment: .top)
     }
 
     private func header(compact: Bool) -> some View {
@@ -630,9 +644,11 @@ struct QuietTasksWidgetView: View {
     @ViewBuilder
     private func completionControl(for task: TaskItem, compact: Bool) -> some View {
         if task.isGoogleTask {
-            Image(systemName: "circle")
-                .font(compact ? .caption.bold() : .callout.bold())
-                .foregroundStyle(palette.mutedText)
+            Link(destination: completeURL(for: task)) {
+                Image(systemName: "circle")
+                    .font(compact ? .caption.bold() : .callout.bold())
+                    .foregroundStyle(palette.mutedText)
+            }
         } else {
             Button(intent: RequestTaskCompletionIntent(taskID: task.id)) {
                 Image(systemName: entry.pendingCompletionTaskID == task.id ? "checkmark.circle" : "circle")

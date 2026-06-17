@@ -19,9 +19,9 @@ Feel free to download it, use it, fork it, and contribute.
 - Daily, weekly, and monthly recurring tasks.
 - Pinned tasks that stay above the regular list.
 - System, light, and dark appearance modes for the app and widget.
-- Optional Google Tasks read-only sync for showing Google task lists in Quiet Tasks.
+- Optional Google Tasks sync for showing a Google task list in Quiet Tasks.
 - Widget shows open tasks only, plus progress for what is currently active.
-- Completing from the widget opens the app for confirmation before the task is cleared.
+- Completing local tasks from the widget uses an inline confirmation. Google task completion opens the app to sync back to Google.
 - No account or cloud service required for local tasks.
 
 ## Why This Is Better
@@ -59,28 +59,32 @@ https://github.com/rakeshutekar/quiet-tasks/releases
 
 Current builds are unsigned development builds. If macOS blocks the app after download, open **System Settings -> Privacy & Security** and allow it, or build from source with Xcode.
 
-## Google Tasks Read-Only Sync
+## Google Tasks Sync
 
-Quiet Tasks can import tasks from one Google Tasks list and show them in the app and widget. This first version is read-only: edits, completions, and deletes must still happen in Google Tasks.
+Quiet Tasks can import tasks from one Google Tasks list and show them in the app and widget. Completing or restoring a Google task in Quiet Tasks syncs that status back to Google Tasks. Google Tasks sync runs after connect, when the app becomes active, when you press Refresh, and every minute while the app is running. Editing, deleting, and subtask writes still happen in Google Tasks.
 
-To use it:
+To use it in the app:
 
-1. Create an OAuth client in Google Cloud for an installed/native app.
-2. Add this redirect URI:
+1. Open **Quiet Tasks -> Settings -> Google Tasks**.
+2. Click **Connect Google**.
+3. Choose a Google account, choose a task list, then click **Sync Now**.
+
+For forks or local builds that use their own Google Cloud project:
+
+1. In Google Cloud, open **APIs & Services -> Library** and enable **Google Tasks API**.
+2. Open **APIs & Services -> OAuth consent screen** and configure the app. If the publishing status is **Testing**, add your Google account as a test user.
+3. Open **APIs & Services -> Credentials -> Create Credentials -> OAuth client ID**.
+4. Select **Application type: Desktop app**, name it `Quiet Tasks`, and create it.
+5. Copy the generated **Client ID**. You do not need to add a redirect URI for a Desktop app; Quiet Tasks uses a temporary localhost callback during sign-in.
+6. Open **Quiet Tasks -> Settings -> Google Tasks -> Advanced** and paste the Desktop OAuth client ID.
+
+Quiet Tasks requests the Google Tasks scope:
 
 ```text
-com.rakeshutekar.quiettasks:/oauth2redirect
+https://www.googleapis.com/auth/tasks
 ```
 
-3. Open **Quiet Tasks -> Settings -> Google Tasks**.
-4. Paste the OAuth client ID.
-5. Connect Google, choose a task list, then click **Sync Now**.
-
-Quiet Tasks requests the read-only Google Tasks scope:
-
-```text
-https://www.googleapis.com/auth/tasks.readonly
-```
+If you connected before completion sync was added, disconnect and reconnect Google Tasks once so Google grants the write scope.
 
 Google Tasks due dates are date-only. If a Google task has a due date, Quiet Tasks shows the date without an exact time.
 
