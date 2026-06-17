@@ -228,6 +228,11 @@ enum TaskStore {
 
 struct WidgetState: Codable, Equatable {
     var pendingCompletionTaskID: String?
+    var taskPage: Int?
+
+    var pageIndex: Int {
+        max(0, taskPage ?? 0)
+    }
 }
 
 enum WidgetStateStore {
@@ -239,15 +244,32 @@ enum WidgetStateStore {
         guard let data = try? Data(contentsOf: fileURL),
               let state = try? JSONDecoder.taskDecoder.decode(WidgetState.self, from: data)
         else {
-            return WidgetState(pendingCompletionTaskID: nil)
+            return WidgetState(pendingCompletionTaskID: nil, taskPage: nil)
         }
         return state
     }
 
-    static func setPendingCompletionTaskID(_ taskID: String?) {
-        guard let data = try? JSONEncoder.taskEncoder.encode(WidgetState(pendingCompletionTaskID: taskID)) else { return }
+    static func save(_ state: WidgetState) {
+        guard let data = try? JSONEncoder.taskEncoder.encode(state) else { return }
         try? FileManager.default.createDirectory(at: TaskStore.sharedDirectory, withIntermediateDirectories: true)
         try? data.write(to: fileURL, options: .atomic)
+    }
+
+    static func setPendingCompletionTaskID(_ taskID: String?) {
+        var state = load()
+        state.pendingCompletionTaskID = taskID
+        save(state)
+    }
+
+    static func changeTaskPage(by delta: Int, visibleLimit: Int) {
+        let visibleLimit = max(1, visibleLimit)
+        let openCount = TaskStore.load().filter { !$0.done }.count
+        let maxPage = max(0, Int(ceil(Double(openCount) / Double(visibleLimit))) - 1)
+        var state = load()
+        let nextPage = min(max(state.pageIndex + delta, 0), maxPage)
+        state.taskPage = nextPage
+        state.pendingCompletionTaskID = nil
+        save(state)
     }
 }
 
@@ -355,11 +377,39 @@ struct CompleteTaskFromWidgetIntent: AppIntent {
     }
 }
 
+struct ChangeWidgetTaskPageIntent: AppIntent {
+    static var title: LocalizedStringResource = "Change Task Page"
+    static var description = IntentDescription("Shows the next or previous group of tasks in the Quiet Tasks widget.")
+
+    @Parameter(title: "Direction")
+    var delta: Int
+
+    @Parameter(title: "Visible Limit")
+    var visibleLimit: Int
+
+    init() {
+        delta = 0
+        visibleLimit = 1
+    }
+
+    init(delta: Int, visibleLimit: Int) {
+        self.delta = delta
+        self.visibleLimit = visibleLimit
+    }
+
+    func perform() async throws -> some IntentResult {
+        WidgetStateStore.changeTaskPage(by: delta, visibleLimit: visibleLimit)
+        WidgetCenter.shared.reloadAllTimelines()
+        return .result()
+    }
+}
+
 struct QuietEntry: TimelineEntry {
     let date: Date
     let tasks: [TaskItem]
     let appearance: AppearanceMode
     let pendingCompletionTaskID: String?
+    let taskPage: Int
 }
 
 struct Provider: TimelineProvider {
@@ -367,24 +417,28 @@ struct Provider: TimelineProvider {
         QuietEntry(date: Date(), tasks: [
             TaskItem(id: "1", title: "Plan sprint review", deadline: Date(), done: false, createdAt: Date(), notes: nil, priority: .high, updatedAt: nil, completedAt: nil),
             TaskItem(id: "2", title: "Send design notes", deadline: nil, done: false, createdAt: Date(), notes: nil, priority: .normal, updatedAt: nil, completedAt: nil)
-        ], appearance: WidgetSettingsStore.loadAppearance(), pendingCompletionTaskID: nil)
+        ], appearance: WidgetSettingsStore.loadAppearance(), pendingCompletionTaskID: nil, taskPage: 0)
     }
 
     func getSnapshot(in context: Context, completion: @escaping (QuietEntry) -> Void) {
+        let state = WidgetStateStore.load()
         completion(QuietEntry(
             date: Date(),
             tasks: TaskStore.load(),
             appearance: WidgetSettingsStore.loadAppearance(),
-            pendingCompletionTaskID: WidgetStateStore.load().pendingCompletionTaskID
+            pendingCompletionTaskID: state.pendingCompletionTaskID,
+            taskPage: state.pageIndex
         ))
     }
 
     func getTimeline(in context: Context, completion: @escaping (Timeline<QuietEntry>) -> Void) {
+        let state = WidgetStateStore.load()
         let entry = QuietEntry(
             date: Date(),
             tasks: TaskStore.load(),
             appearance: WidgetSettingsStore.loadAppearance(),
-            pendingCompletionTaskID: WidgetStateStore.load().pendingCompletionTaskID
+            pendingCompletionTaskID: state.pendingCompletionTaskID,
+            taskPage: state.pageIndex
         )
         completion(Timeline(entries: [entry], policy: .after(Date().addingTimeInterval(30))))
     }
@@ -500,27 +554,65 @@ struct QuietTasksWidgetView: View {
     }
 
     private func taskListArea(visibleLimit: Int, compact: Bool) -> some View {
-        let hasOverflow = openTasks.count > visibleLimit
+        let page = pageInfo(visibleLimit: visibleLimit)
+        let hasOverflow = page.pageCount > 1
 
         return VStack(alignment: .leading, spacing: compact ? 5 : 7) {
-            ForEach(Array(openTasks.prefix(visibleLimit))) { task in
+            ForEach(page.tasks) { task in
                 taskRow(task, compact: compact)
             }
 
             if hasOverflow {
-                Link(destination: URL(string: "quiettasks://open")!) {
-                    HStack(spacing: 5) {
-                        Image(systemName: "arrow.up.forward")
-                            .font(.system(size: compact ? 8 : 9, weight: .bold))
-                        Text("Open \(openTasks.count - visibleLimit) more")
-                            .font(compact ? .system(size: 9, weight: .bold) : .caption.bold())
-                    }
-                    .foregroundStyle(palette.mutedText)
-                    .lineLimit(1)
-                }
+                pagerFooter(page: page, visibleLimit: visibleLimit, compact: compact)
             }
         }
         .frame(maxHeight: .infinity, alignment: .top)
+    }
+
+    private func pageInfo(visibleLimit: Int) -> (tasks: [TaskItem], pageIndex: Int, pageCount: Int, start: Int, end: Int) {
+        let visibleLimit = max(1, visibleLimit)
+        let pageCount = max(1, Int(ceil(Double(openTasks.count) / Double(visibleLimit))))
+        let pageIndex = min(max(entry.taskPage, 0), pageCount - 1)
+        let start = min(pageIndex * visibleLimit, openTasks.count)
+        let end = min(start + visibleLimit, openTasks.count)
+        let tasks = start < end ? Array(openTasks[start..<end]) : []
+        return (tasks, pageIndex, pageCount, start, end)
+    }
+
+    private func pagerFooter(
+        page: (tasks: [TaskItem], pageIndex: Int, pageCount: Int, start: Int, end: Int),
+        visibleLimit: Int,
+        compact: Bool
+    ) -> some View {
+        HStack(spacing: compact ? 5 : 7) {
+            Link(destination: URL(string: "quiettasks://open")!) {
+                Text("\(page.start + 1)-\(page.end) of \(openTasks.count)")
+                    .font(compact ? .system(size: 9, weight: .bold) : .caption.bold())
+                    .foregroundStyle(palette.mutedText)
+                    .lineLimit(1)
+            }
+
+            Spacer(minLength: 0)
+
+            Button(intent: ChangeWidgetTaskPageIntent(delta: -1, visibleLimit: visibleLimit)) {
+                Image(systemName: "chevron.up")
+                    .font(.system(size: compact ? 9 : 10, weight: .bold))
+                    .foregroundStyle(page.pageIndex == 0 ? palette.mutedText.opacity(0.32) : palette.accent)
+                    .frame(width: compact ? 18 : 22, height: compact ? 18 : 22)
+                    .background(palette.surface.opacity(0.75), in: Circle())
+            }
+            .buttonStyle(.plain)
+
+            Button(intent: ChangeWidgetTaskPageIntent(delta: 1, visibleLimit: visibleLimit)) {
+                Image(systemName: "chevron.down")
+                    .font(.system(size: compact ? 9 : 10, weight: .bold))
+                    .foregroundStyle(page.pageIndex >= page.pageCount - 1 ? palette.mutedText.opacity(0.32) : palette.accent)
+                    .frame(width: compact ? 18 : 22, height: compact ? 18 : 22)
+                    .background(palette.surface.opacity(0.75), in: Circle())
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.top, compact ? 1 : 2)
     }
 
     private func header(compact: Bool) -> some View {
