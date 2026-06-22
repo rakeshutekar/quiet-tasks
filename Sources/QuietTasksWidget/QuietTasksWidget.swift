@@ -57,6 +57,10 @@ struct TaskItem: Codable, Identifiable, Equatable {
         guard !taskSubtasks.isEmpty else { return nil }
         return "\(completedSubtaskCount)/\(taskSubtasks.count)"
     }
+
+    var localRevisionDate: Date {
+        updatedAt ?? completedAt ?? createdAt
+    }
 }
 
 enum TaskSource: String, Codable, Equatable {
@@ -135,27 +139,67 @@ enum AppearanceMode: String, CaseIterable, Codable, Identifiable {
 }
 
 enum SharedFiles {
-    static let appGroupIdentifier = "group.ai.aifund.quiettasks"
+    static let appGroupIdentifiers = [
+        "group.ai.aifund.quiettasks",
+        "group.com.rakeshutekar.quiettasksnative"
+    ]
 
     static var directory: URL {
-        if let groupContainer = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupIdentifier) {
-            let directory = groupContainer.appendingPathComponent("QuietTasks", isDirectory: true)
-            try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-            return directory
+        if let appGroupDirectory = appGroupDirectories.first {
+            return appGroupDirectory
         }
 
         if FileManager.default.fileExists(atPath: legacySharedDirectory.path) {
             return legacySharedDirectory
         }
 
-        let directory = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/QuietTasks", isDirectory: true)
-        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        return directory
+        try? FileManager.default.createDirectory(at: appSupportDirectory, withIntermediateDirectories: true)
+        return appSupportDirectory
+    }
+
+    static var candidateDirectories: [URL] {
+        unique(appGroupDirectories + [
+            legacySharedDirectory,
+            appSupportDirectory,
+            realHomeDirectory.appendingPathComponent("Library/Application Support/QuietTasks", isDirectory: true)
+        ] + directGroupDirectories)
     }
 
     static var legacySharedDirectory: URL {
         URL(fileURLWithPath: "/Users/Shared/QuietTasks", isDirectory: true)
+    }
+
+    private static var appSupportDirectory: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/QuietTasks", isDirectory: true)
+    }
+
+    private static var realHomeDirectory: URL {
+        let username = NSUserName()
+        return URL(fileURLWithPath: NSHomeDirectoryForUser(username) ?? "/Users/\(username)", isDirectory: true)
+    }
+
+    private static var appGroupDirectories: [URL] {
+        appGroupIdentifiers.compactMap { identifier in
+            FileManager.default
+                .containerURL(forSecurityApplicationGroupIdentifier: identifier)?
+                .appendingPathComponent("QuietTasks", isDirectory: true)
+        }
+    }
+
+    private static var directGroupDirectories: [URL] {
+        appGroupIdentifiers.map { identifier in
+            realHomeDirectory
+                .appendingPathComponent("Library/Group Containers/\(identifier)/QuietTasks", isDirectory: true)
+        }
+    }
+
+    private static func unique(_ urls: [URL]) -> [URL] {
+        var seen = Set<String>()
+        return urls.filter { url in
+            let path = url.standardizedFileURL.path
+            return seen.insert(path).inserted
+        }
     }
 }
 
@@ -187,15 +231,94 @@ enum TaskStore {
         SharedFiles.directory
     }
 
+    private struct StoredTasks {
+        var url: URL
+        var tasks: [TaskItem]
+        var modifiedAt: Date
+    }
+
+    private static var fileURLs: [URL] {
+        SharedFiles.candidateDirectories.map {
+            $0.appendingPathComponent("tasks.json")
+        }
+    }
+
     static func load() -> [TaskItem] {
-        guard let data = try? Data(contentsOf: fileURL) else { return [] }
-        return (try? JSONDecoder.taskDecoder.decode([TaskItem].self, from: data)) ?? []
+        let storedTasks = fileURLs.compactMap(readStoredTasks)
+        if let primaryStore = storedTasks.first(where: { $0.url.standardizedFileURL == fileURL.standardizedFileURL }) {
+            if !primaryStore.tasks.isEmpty {
+                let tasks = normalized(mergedTasks(base: primaryStore, stores: storedTasks))
+                write(tasks)
+                return tasks
+            }
+
+            let freshestNonEmptyStore = storedTasks
+                .filter { !$0.tasks.isEmpty }
+                .max(by: { $0.modifiedAt < $1.modifiedAt })
+            if freshestNonEmptyStore == nil || primaryStore.modifiedAt >= (freshestNonEmptyStore?.modifiedAt ?? .distantPast) {
+                write([])
+                return []
+            }
+        }
+
+        guard let freshestStore = storedTasks
+            .filter({ !$0.tasks.isEmpty })
+            .max(by: { $0.modifiedAt < $1.modifiedAt })
+        else {
+            return normalized(storedTasks.first?.tasks ?? [])
+        }
+
+        let tasks = normalized(freshestStore.tasks)
+        write(tasks)
+        return tasks
     }
 
     static func save(_ tasks: [TaskItem]) {
-        guard let data = try? JSONEncoder.taskEncoder.encode(normalized(tasks)) else { return }
-        try? FileManager.default.createDirectory(at: sharedDirectory, withIntermediateDirectories: true)
-        try? data.write(to: fileURL, options: .atomic)
+        write(normalized(tasks))
+    }
+
+    private static func write(_ tasks: [TaskItem]) {
+        guard let data = try? JSONEncoder.taskEncoder.encode(tasks) else { return }
+        for directory in SharedFiles.candidateDirectories {
+            try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try? data.write(to: directory.appendingPathComponent("tasks.json"), options: .atomic)
+        }
+    }
+
+    private static func readStoredTasks(_ url: URL) -> StoredTasks? {
+        guard let data = try? Data(contentsOf: url),
+              let tasks = try? JSONDecoder.taskDecoder.decode([TaskItem].self, from: data)
+        else {
+            return nil
+        }
+        return StoredTasks(url: url, tasks: tasks, modifiedAt: modifiedAt(url))
+    }
+
+    private static func mergedTasks(base: StoredTasks, stores: [StoredTasks]) -> [TaskItem] {
+        var tasksByID = Dictionary(uniqueKeysWithValues: base.tasks.map { ($0.id, $0) })
+
+        for store in stores where store.url.standardizedFileURL != base.url.standardizedFileURL {
+            for task in store.tasks {
+                if let currentTask = tasksByID[task.id] {
+                    if task.localRevisionDate > currentTask.localRevisionDate {
+                        tasksByID[task.id] = task
+                    }
+                } else if task.localRevisionDate >= base.modifiedAt || task.createdAt >= base.modifiedAt {
+                    tasksByID[task.id] = task
+                }
+            }
+        }
+
+        return Array(tasksByID.values)
+    }
+
+    private static func modifiedAt(_ url: URL) -> Date {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let modifiedAt = attributes[.modificationDate] as? Date
+        else {
+            return .distantPast
+        }
+        return modifiedAt
     }
 
     static func complete(taskID: String) {
@@ -263,19 +386,33 @@ enum WidgetStateStore {
         TaskStore.sharedDirectory.appendingPathComponent("widget-state.json")
     }
 
+    private struct StoredState {
+        var state: WidgetState
+        var modifiedAt: Date
+    }
+
+    private static var fileURLs: [URL] {
+        SharedFiles.candidateDirectories.map {
+            $0.appendingPathComponent("widget-state.json")
+        }
+    }
+
     static func load() -> WidgetState {
-        guard let data = try? Data(contentsOf: fileURL),
-              let state = try? JSONDecoder.taskDecoder.decode(WidgetState.self, from: data)
+        guard let freshestState = fileURLs
+            .compactMap(readStoredState)
+            .max(by: { $0.modifiedAt < $1.modifiedAt })
         else {
             return WidgetState(pendingCompletionTaskID: nil, taskPage: nil)
         }
-        return state
+        return freshestState.state
     }
 
     static func save(_ state: WidgetState) {
         guard let data = try? JSONEncoder.taskEncoder.encode(state) else { return }
-        try? FileManager.default.createDirectory(at: TaskStore.sharedDirectory, withIntermediateDirectories: true)
-        try? data.write(to: fileURL, options: .atomic)
+        for directory in SharedFiles.candidateDirectories {
+            try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try? data.write(to: directory.appendingPathComponent("widget-state.json"), options: .atomic)
+        }
     }
 
     static func setPendingCompletionTaskID(_ taskID: String?) {
@@ -294,6 +431,24 @@ enum WidgetStateStore {
         state.pendingCompletionTaskID = nil
         save(state)
     }
+
+    private static func readStoredState(_ url: URL) -> StoredState? {
+        guard let data = try? Data(contentsOf: url),
+              let state = try? JSONDecoder.taskDecoder.decode(WidgetState.self, from: data)
+        else {
+            return nil
+        }
+        return StoredState(state: state, modifiedAt: modifiedAt(url))
+    }
+
+    private static func modifiedAt(_ url: URL) -> Date {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let modifiedAt = attributes[.modificationDate] as? Date
+        else {
+            return .distantPast
+        }
+        return modifiedAt
+    }
 }
 
 enum WidgetSettingsStore {
@@ -301,13 +456,40 @@ enum WidgetSettingsStore {
         SharedFiles.directory.appendingPathComponent("settings.json")
     }
 
+    private struct StoredAppearance {
+        var appearance: AppearanceMode
+        var modifiedAt: Date
+    }
+
+    private static var fileURLs: [URL] {
+        SharedFiles.candidateDirectories.map {
+            $0.appendingPathComponent("settings.json")
+        }
+    }
+
     static func loadAppearance() -> AppearanceMode {
-        guard let data = try? Data(contentsOf: fileURL),
+        fileURLs
+            .compactMap(readStoredAppearance)
+            .max(by: { $0.modifiedAt < $1.modifiedAt })?
+            .appearance ?? .system
+    }
+
+    private static func readStoredAppearance(_ url: URL) -> StoredAppearance? {
+        guard let data = try? Data(contentsOf: url),
               let settings = try? JSONDecoder.taskDecoder.decode(AppSettings.self, from: data)
         else {
-            return .system
+            return nil
         }
-        return settings.appearance ?? .system
+        return StoredAppearance(appearance: settings.appearance ?? .system, modifiedAt: modifiedAt(url))
+    }
+
+    private static func modifiedAt(_ url: URL) -> Date {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let modifiedAt = attributes[.modificationDate] as? Date
+        else {
+            return .distantPast
+        }
+        return modifiedAt
     }
 }
 
