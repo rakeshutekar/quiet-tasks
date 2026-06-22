@@ -134,6 +134,31 @@ enum AppearanceMode: String, CaseIterable, Codable, Identifiable {
     var id: String { rawValue }
 }
 
+enum SharedFiles {
+    static let appGroupIdentifier = "group.ai.aifund.quiettasks"
+
+    static var directory: URL {
+        if let groupContainer = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupIdentifier) {
+            let directory = groupContainer.appendingPathComponent("QuietTasks", isDirectory: true)
+            try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            return directory
+        }
+
+        if FileManager.default.fileExists(atPath: legacySharedDirectory.path) {
+            return legacySharedDirectory
+        }
+
+        let directory = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/QuietTasks", isDirectory: true)
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        return directory
+    }
+
+    static var legacySharedDirectory: URL {
+        URL(fileURLWithPath: "/Users/Shared/QuietTasks", isDirectory: true)
+    }
+}
+
 struct NotificationSettings: Codable, Equatable {
     var enabled: Bool
     var reminderOffsets: [Int]?
@@ -159,9 +184,7 @@ enum TaskStore {
     }
 
     static var sharedDirectory: URL {
-        let directory = URL(fileURLWithPath: "/Users/Shared/QuietTasks", isDirectory: true)
-        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        return directory
+        SharedFiles.directory
     }
 
     static func load() -> [TaskItem] {
@@ -275,8 +298,7 @@ enum WidgetStateStore {
 
 enum WidgetSettingsStore {
     static var fileURL: URL {
-        URL(fileURLWithPath: "/Users/Shared/QuietTasks", isDirectory: true)
-            .appendingPathComponent("settings.json")
+        SharedFiles.directory.appendingPathComponent("settings.json")
     }
 
     static func loadAppearance() -> AppearanceMode {

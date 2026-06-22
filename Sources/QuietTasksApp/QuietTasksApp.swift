@@ -57,6 +57,10 @@ struct TaskItem: Codable, Identifiable, Equatable {
         taskSubtasks.filter(\.done).count
     }
 
+    var localRevisionDate: Date {
+        updatedAt ?? completedAt ?? createdAt
+    }
+
     var subtaskProgressText: String? {
         guard !taskSubtasks.isEmpty else { return nil }
         return "\(completedSubtaskCount)/\(taskSubtasks.count) subtasks"
@@ -230,10 +234,27 @@ struct AppSettings: Codable, Equatable {
 }
 
 enum SharedFiles {
+    static let appGroupIdentifier = "group.ai.aifund.quiettasks"
+
     static var directory: URL {
-        let directory = URL(fileURLWithPath: "/Users/Shared/QuietTasks", isDirectory: true)
+        if let groupContainer = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupIdentifier) {
+            let directory = groupContainer.appendingPathComponent("QuietTasks", isDirectory: true)
+            try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            return directory
+        }
+
+        if FileManager.default.fileExists(atPath: legacySharedDirectory.path) {
+            return legacySharedDirectory
+        }
+
+        let directory = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/QuietTasks", isDirectory: true)
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         return directory
+    }
+
+    static var legacySharedDirectory: URL {
+        URL(fileURLWithPath: "/Users/Shared/QuietTasks", isDirectory: true)
     }
 }
 
@@ -276,7 +297,12 @@ enum GoogleOAuthLocalConfig {
     }
 
     private static var installed: Installed? {
-        guard let data = try? Data(contentsOf: fileURL),
+        let urls = [
+            fileURL,
+            SharedFiles.legacySharedDirectory.appendingPathComponent("google-oauth.json")
+        ]
+
+        guard let data = urls.compactMap({ try? Data(contentsOf: $0) }).first,
               let root = try? JSONDecoder().decode(Root.self, from: data)
         else {
             return nil
@@ -294,10 +320,13 @@ enum TaskStore {
         let username = NSUserName()
         let realHome = URL(fileURLWithPath: NSHomeDirectoryForUser(username) ?? "/Users/\(username)", isDirectory: true)
         return [
+            SharedFiles.legacySharedDirectory.appendingPathComponent("tasks.json"),
             FileManager.default.homeDirectoryForCurrentUser
                 .appendingPathComponent("Library/Application Support/QuietTasks/tasks.json"),
             realHome
                 .appendingPathComponent("Library/Application Support/QuietTasks/tasks.json"),
+            realHome
+                .appendingPathComponent("Library/Group Containers/group.ai.aifund.quiettasks/QuietTasks/tasks.json"),
             realHome
                 .appendingPathComponent("Library/Group Containers/group.com.rakeshutekar.quiettasksnative/QuietTasks/tasks.json")
         ].filter { $0 != fileURL }
@@ -356,9 +385,11 @@ enum SettingsStore {
     }
 
     static func load() -> AppSettings {
-        guard let data = try? Data(contentsOf: fileURL) else {
-            return .default
-        }
+        let urls = [
+            fileURL,
+            SharedFiles.legacySharedDirectory.appendingPathComponent("settings.json")
+        ]
+        guard let data = urls.compactMap({ try? Data(contentsOf: $0) }).first else { return .default }
 
         if let settings = try? JSONDecoder.taskDecoder.decode(AppSettings.self, from: data) {
             return normalized(settings)
@@ -590,7 +621,11 @@ enum GoogleTokenStore {
     }
 
     static func loadRefreshToken() -> String? {
-        guard let data = try? Data(contentsOf: fileURL),
+        let urls = [
+            fileURL,
+            SharedFiles.legacySharedDirectory.appendingPathComponent("google-token.json")
+        ]
+        guard let data = urls.compactMap({ try? Data(contentsOf: $0) }).first,
               let tokenFile = try? JSONDecoder.taskDecoder.decode(TokenFile.self, from: data)
         else {
             return nil
@@ -1296,11 +1331,13 @@ final class TaskModel: ObservableObject {
         deadline: Date?,
         priority: TaskPriority,
         recurrence: TaskRecurrence?,
-        pinned: Bool
+        pinned: Bool,
+        subtasks: [SubtaskItem] = []
     ) {
         let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         let cleanNotes = notes.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanSubtasks = Self.cleanedSubtasks(subtasks)
         tasks.insert(TaskItem(
             id: UUID().uuidString,
             title: trimmed,
@@ -1311,7 +1348,7 @@ final class TaskModel: ObservableObject {
             priority: priority,
             updatedAt: nil,
             completedAt: nil,
-            subtasks: nil,
+            subtasks: cleanSubtasks.isEmpty ? nil : cleanSubtasks,
             recurrence: deadline == nil ? nil : recurrence,
             pinned: pinned ? true : nil,
             deadlineHasTime: deadline == nil ? nil : true
@@ -1332,6 +1369,7 @@ final class TaskModel: ObservableObject {
         let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         let cleanNotes = notes.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanSubtasks = Self.cleanedSubtasks(subtasks)
         tasks = tasks.map { item in
             guard item.id == task.id else { return item }
             guard !item.isGoogleTask else { return item }
@@ -1340,7 +1378,7 @@ final class TaskModel: ObservableObject {
             updated.notes = cleanNotes.isEmpty ? nil : cleanNotes
             updated.deadline = deadline
             updated.priority = priority
-            updated.subtasks = subtasks.isEmpty ? nil : subtasks
+            updated.subtasks = cleanSubtasks.isEmpty ? nil : cleanSubtasks
             updated.recurrence = deadline == nil ? nil : recurrence
             updated.pinned = pinned ? true : nil
             updated.deadlineHasTime = deadline == nil ? nil : true
@@ -1675,17 +1713,62 @@ final class TaskModel: ObservableObject {
             throw GoogleSyncError.missingTaskList
         }
 
+        let syncStartedAt = Date()
+        let startingTaskIDs = Set(tasks.map(\.id))
         let syncedTasks = try await GoogleTasksClient.fetchTasks(
             accessToken: accessToken,
             taskListID: taskListID,
             taskListTitle: googleSettings.selectedTaskListTitle
         )
-        tasks.removeAll { $0.source == .google }
-        tasks.append(contentsOf: syncedTasks)
+        let latestSavedTasks = TaskStore.load()
+        let localTasks = mergedLocalTasksForGoogleSync(
+            latestSavedTasks: latestSavedTasks,
+            currentTasks: tasks,
+            syncStartedAt: syncStartedAt,
+            startingTaskIDs: startingTaskIDs
+        )
+        tasks = TaskStore.normalized(localTasks + syncedTasks)
         settings.googleSync.lastSyncedAt = Date()
         SettingsStore.save(settings)
         persist()
         return syncedTasks.count
+    }
+
+    private func mergedLocalTasksForGoogleSync(
+        latestSavedTasks: [TaskItem],
+        currentTasks: [TaskItem],
+        syncStartedAt: Date,
+        startingTaskIDs: Set<String>
+    ) -> [TaskItem] {
+        var localTasksByID: [String: TaskItem] = [:]
+
+        for task in latestSavedTasks where !task.isGoogleTask {
+            localTasksByID[task.id] = task
+        }
+
+        for task in currentTasks where !task.isGoogleTask {
+            if let savedTask = localTasksByID[task.id] {
+                if task.localRevisionDate > savedTask.localRevisionDate {
+                    localTasksByID[task.id] = task
+                }
+            } else if !startingTaskIDs.contains(task.id) || task.localRevisionDate >= syncStartedAt {
+                localTasksByID[task.id] = task
+            }
+        }
+
+        return Array(localTasksByID.values)
+    }
+
+    private static func cleanedSubtasks(_ subtasks: [SubtaskItem]) -> [SubtaskItem] {
+        let now = Date()
+        return subtasks.compactMap { subtask in
+            let trimmed = subtask.title.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return nil }
+            var cleaned = subtask
+            cleaned.title = trimmed
+            cleaned.updatedAt = cleaned.updatedAt ?? now
+            return cleaned
+        }
     }
 
     private func runGoogleOperation(_ operation: @escaping () async throws -> Void) async {
@@ -1734,6 +1817,8 @@ struct ContentView: View {
     @State private var newDeadline = Date()
     @State private var newHasDeadline = false
     @State private var newPriority: TaskPriority = .normal
+    @State private var newSubtasks: [SubtaskItem] = []
+    @State private var newSubtasksExpanded = false
     @State private var newRecurrence: TaskRecurrence?
     @State private var newPinned = false
     @State private var pendingCompletion: TaskItem?
@@ -1940,6 +2025,14 @@ struct ContentView: View {
                     RecurrencePicker(recurrence: $newRecurrence, isEnabled: newHasDeadline)
                     PinToggle(isPinned: $newPinned)
                 }
+
+                DisclosureGroup(isExpanded: $newSubtasksExpanded) {
+                    SubtaskEditor(subtasks: $newSubtasks, showsTitle: false, showsCompletionToggle: false)
+                        .padding(.top, 6)
+                } label: {
+                    Label(newSubtasks.isEmpty ? "Subtasks" : "\(newSubtasks.count) subtasks", systemImage: "checklist")
+                        .font(.headline)
+                }
             }
         }
         .padding(16)
@@ -1976,16 +2069,20 @@ struct ContentView: View {
     }
 
     private func addTask() {
+        guard !newTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         model.add(
             title: newTitle,
             deadline: newHasDeadline ? newDeadline : nil,
             priority: newPriority,
             recurrence: newHasDeadline ? newRecurrence : nil,
-            pinned: newPinned
+            pinned: newPinned,
+            subtasks: newSubtasks
         )
         newTitle = ""
         newHasDeadline = false
         newPriority = .normal
+        newSubtasks = []
+        newSubtasksExpanded = false
         newRecurrence = nil
         newPinned = false
         selectedFilter = .open
@@ -2038,6 +2135,69 @@ struct ContentView: View {
         default:
             break
         }
+    }
+}
+
+struct SubtaskEditor: View {
+    @Binding var subtasks: [SubtaskItem]
+    var showsTitle = true
+    var showsCompletionToggle = true
+    @State private var newSubtaskTitle = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if showsTitle {
+                Label("Subtasks", systemImage: "checklist")
+                    .font(.headline)
+            }
+
+            ForEach($subtasks) { $subtask in
+                HStack(spacing: 8) {
+                    if showsCompletionToggle {
+                        Toggle("", isOn: $subtask.done)
+                            .labelsHidden()
+                            .toggleStyle(.checkbox)
+                    } else {
+                        Image(systemName: "circle")
+                            .foregroundStyle(Color(red: 0.62, green: 0.86, blue: 0.88))
+                    }
+
+                    TextField("Subtask", text: $subtask.title)
+                        .textFieldStyle(.roundedBorder)
+
+                    Button(role: .destructive) {
+                        subtasks.removeAll { $0.id == subtask.id }
+                    } label: {
+                        Image(systemName: "trash")
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Delete subtask")
+                }
+            }
+
+            HStack(spacing: 8) {
+                TextField("Add subtask", text: $newSubtaskTitle)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit(addSubtask)
+                Button(action: addSubtask) {
+                    Label("Add", systemImage: "plus")
+                }
+                .disabled(newSubtaskTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+    }
+
+    private func addSubtask() {
+        let trimmed = newSubtaskTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        subtasks.append(SubtaskItem(
+            id: UUID().uuidString,
+            title: trimmed,
+            done: false,
+            createdAt: Date(),
+            updatedAt: nil
+        ))
+        newSubtaskTitle = ""
     }
 }
 
@@ -2164,7 +2324,6 @@ struct TaskRow: View {
 
 struct TaskEditSheet: View {
     @State var draft: TaskDraft
-    @State private var newSubtaskTitle = ""
     var onSave: (TaskDraft) -> Void
     var onCancel: () -> Void
 
@@ -2187,37 +2346,7 @@ struct TaskEditSheet: View {
                 PinToggle(isPinned: $draft.pinned)
             }
 
-            VStack(alignment: .leading, spacing: 10) {
-                Label("Subtasks", systemImage: "checklist")
-                    .font(.headline)
-
-                ForEach($draft.subtasks) { $subtask in
-                    HStack(spacing: 8) {
-                        Toggle("", isOn: $subtask.done)
-                            .labelsHidden()
-                            .toggleStyle(.checkbox)
-                        TextField("Subtask", text: $subtask.title)
-                            .textFieldStyle(.roundedBorder)
-                        Button(role: .destructive) {
-                            draft.subtasks.removeAll { $0.id == subtask.id }
-                        } label: {
-                            Image(systemName: "trash")
-                        }
-                        .buttonStyle(.borderless)
-                        .help("Delete subtask")
-                    }
-                }
-
-                HStack(spacing: 8) {
-                    TextField("Add subtask", text: $newSubtaskTitle)
-                        .textFieldStyle(.roundedBorder)
-                        .onSubmit(addSubtask)
-                    Button(action: addSubtask) {
-                        Label("Add", systemImage: "plus")
-                    }
-                    .disabled(newSubtaskTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                }
-            }
+            SubtaskEditor(subtasks: $draft.subtasks)
 
             HStack {
                 Spacer()
@@ -2232,19 +2361,6 @@ struct TaskEditSheet: View {
         }
         .padding(24)
         .frame(width: 520)
-    }
-
-    private func addSubtask() {
-        let trimmed = newSubtaskTitle.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        draft.subtasks.append(SubtaskItem(
-            id: UUID().uuidString,
-            title: trimmed,
-            done: false,
-            createdAt: Date(),
-            updatedAt: nil
-        ))
-        newSubtaskTitle = ""
     }
 
     private func saveDraft() {
