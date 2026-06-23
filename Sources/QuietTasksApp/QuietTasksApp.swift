@@ -1,4 +1,5 @@
 import AppKit
+import AuthenticationServices
 import CryptoKit
 import Darwin
 import Foundation
@@ -1054,15 +1055,19 @@ enum GoogleOAuthClient {
         ]
 
         guard let authorizationURL = components.url else { throw GoogleSyncError.invalidResponse }
-        let callbackTask = Task {
-            try await receiver.waitForCallback(timeout: 180)
-        }
-        guard NSWorkspace.shared.open(authorizationURL) else {
-            receiver.cancel()
-            throw GoogleSyncError.apiError("Could not open Google sign-in in your browser.")
+        let callbackURL = try await OAuthWebAuthenticationSession.authenticate(
+            url: authorizationURL,
+            callbackScheme: "http"
+        )
+        guard let expectedRedirectURL = URL(string: receiver.redirectURI),
+              callbackURL.scheme == expectedRedirectURL.scheme,
+              callbackURL.host == expectedRedirectURL.host,
+              callbackURL.port == expectedRedirectURL.port,
+              callbackURL.path == expectedRedirectURL.path
+        else {
+            throw GoogleSyncError.invalidResponse
         }
 
-        let callbackURL = try await callbackTask.value
         let queryItems = URLComponents(url: callbackURL, resolvingAgainstBaseURL: false)?.queryItems ?? []
         if let error = queryItems.first(where: { $0.name == "error" })?.value {
             let description = queryItems.first(where: { $0.name == "error_description" })?.value
@@ -1191,6 +1196,50 @@ enum GoogleOAuthClient {
             return "\(error): \(description)"
         }
         return error
+    }
+}
+
+final class OAuthWebAuthenticationSession: NSObject, ASWebAuthenticationPresentationContextProviding {
+    private var session: ASWebAuthenticationSession?
+
+    static func authenticate(url: URL, callbackScheme: String) async throws -> URL {
+        let webSession = OAuthWebAuthenticationSession()
+        return try await webSession.authenticate(url: url, callbackScheme: callbackScheme)
+    }
+
+    func authenticate(url: URL, callbackScheme: String) async throws -> URL {
+        try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.main.async {
+                let session = ASWebAuthenticationSession(url: url, callbackURLScheme: callbackScheme) { callbackURL, error in
+                    self.session = nil
+
+                    if let callbackURL {
+                        continuation.resume(returning: callbackURL)
+                    } else if error != nil {
+                        continuation.resume(throwing: GoogleSyncError.oauthCancelled)
+                    } else {
+                        continuation.resume(throwing: GoogleSyncError.invalidResponse)
+                    }
+                }
+
+                session.presentationContextProvider = self
+                session.prefersEphemeralWebBrowserSession = false
+                self.session = session
+
+                guard session.start() else {
+                    self.session = nil
+                    continuation.resume(throwing: GoogleSyncError.apiError("Could not start Google Tasks authorization."))
+                    return
+                }
+            }
+        }
+    }
+
+    func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
+        NSApplication.shared.keyWindow
+            ?? NSApplication.shared.mainWindow
+            ?? NSApplication.shared.windows.first
+            ?? ASPresentationAnchor()
     }
 }
 
@@ -2751,7 +2800,7 @@ struct SettingsSheet: View {
                 }
             }
 
-            Text("Sync imports Google Tasks into the app and widget. Completing or restoring a Google task here updates Google Tasks too.")
+            Text("Optional Google Tasks sync imports tasks into the app and widget. Completing or restoring a synced task here updates Google Tasks too.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
 
@@ -2800,7 +2849,7 @@ struct SettingsSheet: View {
                         saveSettings()
                         Task { await model.connectGoogle(clientID: draft.googleSync.clientID) }
                     } label: {
-                        Label("Connect Google", systemImage: "person.crop.circle.badge.plus")
+                        Label("Connect Google Tasks", systemImage: "person.crop.circle.badge.plus")
                     }
                     .buttonStyle(.borderedProminent)
                     .disabled(model.isGoogleBusy)
@@ -2916,12 +2965,21 @@ struct ProgressRing: View {
 
 @main
 struct QuietTasksApp: App {
+    @Environment(\.openWindow) private var openWindow
+
     var body: some Scene {
-        WindowGroup {
+        WindowGroup("Quiet Tasks", id: "main") {
             ContentView()
         }
         .commands {
             CommandGroup(replacing: .newItem) {}
+            CommandGroup(after: .windowArrangement) {
+                Button("Show Quiet Tasks") {
+                    openWindow(id: "main")
+                    NSApplication.shared.activate()
+                }
+                .keyboardShortcut("0", modifiers: [.command])
+            }
         }
     }
 }
